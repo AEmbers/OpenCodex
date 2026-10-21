@@ -508,7 +508,7 @@ function withHiddenAppServerMcpStartupBudget(args) {
   if (appServerIndex < 0) return result;
   const timeoutSeconds = hiddenMcpStartupTimeoutSeconds();
   const additions = [];
-  for (const serverName of ["node_repl", "cua_repl"]) {
+  for (const serverName of ["node_repl"]) {
     const key = `mcp_servers.${serverName}.startup_timeout_sec`;
     if (!hasHiddenAppServerConfig(result, key)) additions.push("-c", `${key}=${timeoutSeconds}`);
   }

@@ -239,8 +239,6 @@ test("hidden app-server receives a bounded MCP startup budget", () => {
     "features.code_mode_host=true",
     "-c",
     "mcp_servers.node_repl.startup_timeout_sec=5",
-    "-c",
-    "mcp_servers.cua_repl.startup_timeout_sec=5",
     "app-server",
     "--analytics-default-enabled",
   ]);
@@ -251,8 +249,6 @@ test("hidden app-server preserves explicit MCP startup timeouts", () => {
   const args = [
     "-c",
     "mcp_servers.node_repl.startup_timeout_sec=30",
-    "--config",
-    "mcp_servers.cua_repl.startup_timeout_sec=12",
     "app-server",
   ];
   assert.deepEqual(__test.withHiddenAppServerMcpStartupBudget(args), args);
