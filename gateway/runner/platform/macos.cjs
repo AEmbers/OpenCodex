@@ -18,6 +18,7 @@ const {
 } = require("../shared/fs-utils.cjs");
 const { logLine } = require("../shared/logging.cjs");
 const { writeGatewayAsar } = require("../shared/runner-asar.cjs");
+const { pathIsInside, refreshMacIntegrity } = require("./macos-integrity.cjs");
 const { runner: runnerPoints } = require("../../runtime/modification/point-refs.cjs");
 
 function escapePlistString(value) {
@@ -83,6 +84,8 @@ function officialFrameworksFingerprint(layout) {
     }
   } catch {}
   return {
+    // 旧缓存可能包含 cpSync 改写出的官方绝对链接，升级后必须强制重建一次。
+    copyVersion: 3,
     source: realpathSafe(layout.frameworksDir),
     appRoot: realpathSafe(layout.appRoot),
     executable: fileFingerprint(layout.executablePath),
@@ -95,13 +98,95 @@ function sameFrameworksFingerprint(left, right) {
   return JSON.stringify(left || null) === JSON.stringify(right || null);
 }
 
+function hasExternalSymlinks(dirPath, rootDir = dirPath) {
+  const lexicalRoot = path.resolve(rootDir);
+  let realRoot = lexicalRoot;
+  try {
+    realRoot = fs.realpathSync(rootDir);
+  } catch {
+    return true;
+  }
+
+  try {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = fs.readlinkSync(fullPath);
+        const lexicalTarget = path.resolve(path.dirname(fullPath), target);
+        if (!pathIsInside(lexicalRoot, lexicalTarget)) return true;
+        try {
+          // 符号链接链的最终目标也必须留在 runner 缓存内，防止相对链接绕过 lexical 检查。
+          if (!pathIsInside(realRoot, fs.realpathSync(fullPath))) return true;
+        } catch {
+          return true;
+        }
+      } else if (entry.isDirectory() && hasExternalSymlinks(fullPath, rootDir)) {
+        return true;
+      }
+    }
+  } catch {
+    // 无法完整检查缓存时按失效处理并重新复制，避免沿未知链接写入官方安装目录。
+    return true;
+  }
+  return false;
+}
+
+function runCodesign(codesign, args) {
+  codesign("/usr/bin/codesign", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+function signChangedFrameworkCopies({ changedFrameworks, runnerFrameworksDir, codesign, logger }) {
+  if (!changedFrameworks.length) return;
+  const rootRealPath = fs.realpathSync(runnerFrameworksDir);
+
+  for (const binaryPath of changedFrameworks) {
+    const helpersDir = path.join(path.dirname(binaryPath), "Helpers");
+    if (isDirectory(helpersDir)) {
+      for (const entry of fs.readdirSync(helpersDir, { withFileTypes: true })) {
+        if (!entry.name.endsWith(".app")) continue;
+        const helperPath = path.join(helpersDir, entry.name);
+        const helperRealPath = fs.realpathSync(helperPath);
+        if (!pathIsInside(rootRealPath, helperRealPath)) {
+          throw new Error(`Runner helper escapes its cache directory: ${entry.name}`);
+        }
+        /**
+         * Helper 必须与修改后的 Framework 使用同一临时签名。保留标识和 entitlement，
+         * 但清除 Hardened Runtime 标志，避免原官方 Team ID 与本机 Framework 冲突。
+         */
+        runCodesign(codesign, [
+          "--force",
+          "--sign",
+          "-",
+          "--options",
+          "0",
+          "--preserve-metadata=identifier,entitlements",
+          helperRealPath,
+        ]);
+      }
+    }
+
+    // 主 Framework 二进制最后签名，使其覆盖刚刚写入的完整性摘要。
+    runCodesign(codesign, [
+      "--force",
+      "--sign",
+      "-",
+      "--preserve-metadata=identifier,entitlements,flags",
+      binaryPath,
+    ]);
+    logLine(logger, `signed macOS Framework copy: ${binaryPath}`);
+  }
+}
+
 function ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath, logger }) {
   const nextFingerprint = officialFrameworksFingerprint(layout);
   const previous = readJsonIfPresent(markerPath);
   if (
     previous &&
     sameFrameworksFingerprint(previous.fingerprint, nextFingerprint) &&
-    isDirectory(runnerFrameworksDir)
+    isDirectory(runnerFrameworksDir) &&
+    !hasExternalSymlinks(runnerFrameworksDir, runnerFrameworksDir)
   ) {
     logLine(logger, `official Electron Frameworks cache hit: ${runnerFrameworksDir}`);
     return { copied: false };
@@ -110,9 +195,17 @@ function ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath, logger 
   /**
    * 不能把 Contents/Frameworks 做成指向 /Applications 的符号链接：官方 helper 进程会按 runner
    * 内部路径回溯加载 framework，macOS sandbox 会拒绝跨 bundle symlink。这里复制到运行态 cache。
+   *
+   * fs.cpSync 默认会把相对符号链接解析成官方安装目录的绝对链接；verbatimSymlinks 保留
+   * Framework 内部的 Versions/Current 结构，保证 runner 始终引用自己的隔离副本。
    */
+  fs.rmSync(markerPath, { force: true });
   fs.rmSync(runnerFrameworksDir, { recursive: true, force: true });
-  fs.cpSync(layout.frameworksDir, runnerFrameworksDir, { recursive: true, force: true });
+  fs.cpSync(layout.frameworksDir, runnerFrameworksDir, {
+    recursive: true,
+    force: true,
+    verbatimSymlinks: true,
+  });
   writeJson(markerPath, {
     fingerprint: nextFingerprint,
     copiedAt: new Date().toISOString(),
@@ -121,17 +214,21 @@ function ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath, logger 
   return { copied: true };
 }
 
-function signRunnerExecutable(executablePath) {
+function signRunnerExecutable(executablePath, codesign) {
   /**
-   * 官方主二进制复制到 runner 后原签名会失效；只重签这个入口壳。
-   * Frameworks 保留官方签名副本，避免 deep 签名破坏 Chromium framework 的封装结构。
+   * 官方主二进制复制到 runner 后原签名会失效；最后重签入口壳，
+   * 让 Info.plist、app.asar 和已刷新的 Framework 一起封存到本地临时签名中。
    */
-  execFileSync("/usr/bin/codesign", ["--force", "--sign", "-", executablePath], {
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  runCodesign(codesign, ["--force", "--sign", "-", executablePath]);
 }
 
-async function createMacRunner({ layout, runtimeDir, logger, runCompatibility = (_point, operation) => operation() }) {
+async function createMacRunner({
+  layout,
+  runtimeDir,
+  logger,
+  runCompatibility = (_point, operation) => operation(),
+  codesign = execFileSync,
+}) {
   const workDir = path.join(runtimeDir, "official-electron-runner");
   const runnerAppPath = path.join(workDir, RUNNER_APP_NAME);
   const contentsDir = path.join(runnerAppPath, "Contents");
@@ -150,22 +247,38 @@ async function createMacRunner({ layout, runtimeDir, logger, runCompatibility = 
   fs.copyFileSync(layout.executablePath, runnerExecutablePath);
   fs.chmodSync(runnerExecutablePath, 0o755);
   ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath: frameworksMarkerPath, logger });
-  // ASAR 完成后才能生成包含最终哈希的 plist；签名必须放在这两步之后。
-  const runnerAsarPath = await runCompatibility(
-    runnerPoints.gatewayAsar,
-    () => writeGatewayAsar({ runnerResourcesDir, workDir })
-  );
-  runCompatibility(
-    runnerPoints.macosBackgroundBundle,
-    () => {
-      fs.writeFileSync(path.join(contentsDir, "Info.plist"), runnerInfoPlist(runnerAsarPath), "utf8");
-      fs.writeFileSync(path.join(contentsDir, "PkgInfo"), "APPL????", "utf8");
-    }
-  );
-  runCompatibility(
-    runnerPoints.macosEntrySignature,
-    () => signRunnerExecutable(runnerExecutablePath)
-  );
+  let changedFrameworks = [];
+  try {
+    // ASAR 完成后才能生成包含最终哈希的 plist；Framework 摘要和签名必须放在这两步之后。
+    const runnerAsarPath = await runCompatibility(
+      runnerPoints.gatewayAsar,
+      () => writeGatewayAsar({ runnerResourcesDir, workDir })
+    );
+    runCompatibility(
+      runnerPoints.macosBackgroundBundle,
+      () => {
+        fs.writeFileSync(path.join(contentsDir, "Info.plist"), runnerInfoPlist(runnerAsarPath), "utf8");
+        fs.writeFileSync(path.join(contentsDir, "PkgInfo"), "APPL????", "utf8");
+        changedFrameworks = refreshMacIntegrity(runnerFrameworksDir, runnerAsarPath);
+      }
+    );
+    runCompatibility(
+      runnerPoints.macosEntrySignature,
+      () => {
+        signChangedFrameworkCopies({
+          changedFrameworks,
+          runnerFrameworksDir,
+          codesign,
+          logger,
+        });
+        signRunnerExecutable(runnerExecutablePath, codesign);
+      }
+    );
+  } catch (error) {
+    // 摘要写入后签名若失败，下次必须从官方副本重建，不能误用半成品缓存。
+    fs.rmSync(frameworksMarkerPath, { force: true });
+    throw error;
+  }
 
   logLine(logger, `prepared official Electron runner: app=${runnerAppPath}`);
   logLine(logger, `official Electron source: app=${layout.appRoot} asar=${layout.asarPath}`);
