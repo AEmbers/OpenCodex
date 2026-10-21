@@ -62,7 +62,8 @@ test("gateway plugin config validates types, writes atomically and detects revis
   assert.equal(plugin.values.showRouteInSummary, true);
   assert.deepEqual(plugin.tiers.map((tier) => tier.id), ["economy", "balanced", "complex", "frontier"]);
   assert.equal(plugin.tiers.every((tier) => tier.builtin && tier.enabled), true);
-  assert.deepEqual(plugin.tiers.map((tier) => tier.effort), ["auto", "max", "max", "ultra"]);
+  // 新版默认档位改用官方 medium/high 推理强度名称，避免继续写入旧 ultra 别名。
+  assert.deepEqual(plugin.tiers.map((tier) => tier.effort), ["auto", "max", "medium", "high"]);
   assert.equal(plugin.values.fallbackEffort, "auto");
 
   const updated = store.update(plugin.id, {
