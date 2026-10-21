@@ -52,8 +52,8 @@ OpenCodex 是一个 Codex 桌面运行时中间层，同时兼容旧版 Codex De
 下载安装：
 
 提供2种下载渠道：
-- [Release](https://github.com/RyensX/OpenCodex/releases): 正式版本，较为稳定，推荐使用
-- [Artifacts](https://github.com/RyensX/OpenCodex/actions): 测试版本，push 时 CI 自动打包，可用于尝鲜新功能。注意下载Artifacts需要登录Github
+- [Release](https://github.com/AEmbers/OpenCodex/releases): 本 Fork 的兼容修复版本
+- [Artifacts](https://github.com/AEmbers/OpenCodex/actions): 本 Fork 的 CI 测试版本。注意下载 Artifacts 需要登录 GitHub
 
 macOS 首次启动遇到安全提示时，请参考：
 - [macOS 首次启动授权指南](docs/macos-installation.zh.md)

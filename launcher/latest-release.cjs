@@ -1,6 +1,29 @@
 "use strict";
 
-const DEFAULT_RELEASE_API_URL = "https://api.github.com/repos/RyensX/OpenCodex/releases/latest";
+const packageInfo = require("../package.json");
+
+function githubRepositorySlug(value) {
+  const raw = String(value || "").trim().replace(/^git\+/, "");
+  const scpStyle = /^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i.exec(raw);
+  if (scpStyle) return `${scpStyle[1]}/${scpStyle[2]}`;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.hostname !== "github.com") return "";
+    const parts = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
+    if (parts.length !== 2) return "";
+    return `${parts[0]}/${parts[1].replace(/\.git$/i, "")}`;
+  } catch {
+    return "";
+  }
+}
+
+// 更新检查跟随当前 Fork 的 package repository，不能把用户导回上游发布页。
+const DEFAULT_RELEASE_REPOSITORY = githubRepositorySlug(packageInfo.repository?.url);
+if (!DEFAULT_RELEASE_REPOSITORY) {
+  throw new Error("package.json repository must point to a GitHub repository");
+}
+const DEFAULT_RELEASE_API_URL =
+  `https://api.github.com/repos/${DEFAULT_RELEASE_REPOSITORY}/releases/latest`;
 
 function createInitialLatestReleaseState() {
   return {
@@ -35,12 +58,12 @@ function releaseVersionChanged(tagName, currentVersionLabel) {
   return !!remoteVersion && remoteVersion !== currentVersion;
 }
 
-function trustedReleaseUrl(value) {
+function trustedReleaseUrl(value, repository = DEFAULT_RELEASE_REPOSITORY) {
   try {
     const url = new URL(String(value || ""));
     // 更新入口只允许 GitHub 上当前仓库的 release 页面，避免异常接口响应扩大外链范围。
     if (url.protocol !== "https:" || url.hostname !== "github.com") return "";
-    if (!url.pathname.startsWith("/RyensX/OpenCodex/releases/")) return "";
+    if (!url.pathname.startsWith(`/${repository}/releases/`)) return "";
     return url.toString();
   } catch {
     return "";
@@ -100,4 +123,9 @@ module.exports = {
   createInitialLatestReleaseState,
   fetchLatestReleaseState,
   markLatestReleaseChecking,
+  __test: {
+    DEFAULT_RELEASE_API_URL,
+    DEFAULT_RELEASE_REPOSITORY,
+    trustedReleaseUrl,
+  },
 };
