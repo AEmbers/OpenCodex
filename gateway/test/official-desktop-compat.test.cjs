@@ -1349,6 +1349,10 @@ test("macOS runner embeds its current ASAR header hash before signing, including
   writeFile(layout.executablePath, "official executable");
   writeFile(layout.asarPath, "official archive must remain unchanged");
   fs.mkdirSync(layout.frameworksDir, { recursive: true });
+  writeFile(
+    path.join(layout.frameworksDir, "Electron Framework.framework", "Electron Framework"),
+    integritySlot(1, 1)
+  );
   const runtimeDir = path.join(root, "runtime");
   const logs = [];
   const hashes = [];
@@ -1359,6 +1363,8 @@ test("macOS runner embeds its current ASAR header hash before signing, including
       layout,
       runtimeDir,
       logger: (line) => logs.push(line),
+      electronVersion: "42.0.1",
+      codesign() {},
       runCompatibility(point, operation) {
         points.push(point.id);
         if (point === runnerPoints.gatewayAsar) {
@@ -1372,7 +1378,8 @@ test("macOS runner embeds its current ASAR header hash before signing, including
           })();
         }
         if (point === runnerPoints.macosEntrySignature) {
-          // 只替换平台签名操作；真实执行打包与 plist 生成，并在签名前检查最终产物。
+          // 实际执行签名分支，并用注入的空 codesign 检查最终产物与哈希。
+          const result = operation();
           const workDir = path.join(runtimeDir, "official-electron-runner");
           const runnerApp = fs.readdirSync(workDir).find((name) => name.endsWith(".app"));
           const contentsDir = path.join(workDir, runnerApp, "Contents");
@@ -1383,7 +1390,7 @@ test("macOS runner embeds its current ASAR header hash before signing, including
           assert.ok(plist.includes(`<string>${hash}</string>`));
           assert.match(plist, /<key>LSBackgroundOnly<\/key>\s*<true\/>/);
           hashes.push(hash);
-          return;
+          return result;
         }
         return operation();
       },
@@ -1418,16 +1425,24 @@ test("macOS integrity refresh updates every enabled version 1 slot and is idempo
   const secondSlot = integritySlot(1, 1, Buffer.alloc(32, 7));
   writeFile(binaryPath, Buffer.concat([Buffer.from("mach-o-prefix"), firstSlot, secondSlot, Buffer.from("suffix")]));
 
-  assert.deepEqual(refreshMacIntegrity(path.join(root, "Frameworks"), runnerAsarPath), [
-    fs.realpathSync(binaryPath),
-  ]);
+  assert.deepEqual(
+    refreshMacIntegrity(path.join(root, "Frameworks"), runnerAsarPath, {
+      electronVersion: "42.0.1",
+    }),
+    [fs.realpathSync(binaryPath)]
+  );
   const expectedDigest = runnerAsarDictionaryDigest(runnerAsarPath);
   const updated = fs.readFileSync(binaryPath);
   const firstDigestOffset = Buffer.from("mach-o-prefix").length + INTEGRITY_DIGEST_SENTINEL.length + 2;
   const secondDigestOffset = firstDigestOffset + 32 + INTEGRITY_DIGEST_SENTINEL.length + 2;
   assert.deepEqual(updated.subarray(firstDigestOffset, firstDigestOffset + 32), expectedDigest);
   assert.deepEqual(updated.subarray(secondDigestOffset, secondDigestOffset + 32), expectedDigest);
-  assert.deepEqual(refreshMacIntegrity(path.join(root, "Frameworks"), runnerAsarPath), []);
+  assert.deepEqual(
+    refreshMacIntegrity(path.join(root, "Frameworks"), runnerAsarPath, {
+      electronVersion: "42.0.1",
+    }),
+    []
+  );
 });
 
 test("macOS integrity refresh leaves disabled slots alone and rejects unknown versions before writing", async (t) => {
@@ -1444,12 +1459,35 @@ test("macOS integrity refresh leaves disabled slots alone and rejects unknown ve
   writeFile(unknownPath, unknown);
 
   assert.throws(
-    () => refreshMacIntegrity(frameworksDir, runnerAsarPath),
+    () => refreshMacIntegrity(frameworksDir, runnerAsarPath, { electronVersion: "42.0.1" }),
     /Unsupported macOS integrity digest version 2/
   );
   assert.deepEqual(fs.readFileSync(disabledPath), disabled);
   assert.deepEqual(fs.readFileSync(pendingPath), pending);
   assert.deepEqual(fs.readFileSync(unknownPath), unknown);
+});
+
+test("macOS integrity requires an active slot for Electron 41+ while preserving the legacy boundary", async (t) => {
+  const { root, runnerAsarPath } = await createIntegrityFixture(t);
+  const frameworksDir = path.join(root, "Frameworks");
+  const disabledPath = path.join(frameworksDir, "Disabled.framework", "Disabled");
+  const disabled = Buffer.concat([integritySlot(0, 0), Buffer.from("disabled")]);
+  writeFile(disabledPath, disabled);
+
+  assert.throws(
+    () => refreshMacIntegrity(frameworksDir, runnerAsarPath, { electronVersion: "unknown" }),
+    /Cannot determine Electron version/
+  );
+  // 支持的 Electron 缺槽位时必须拒绝，不能把 ASAR 完整性静默降级为 fail-open。
+  assert.throws(
+    () => refreshMacIntegrity(frameworksDir, runnerAsarPath, { electronVersion: "42.0.1" }),
+    /requires an active macOS integrity digest slot/
+  );
+  // Electron 40 没有 integrity_digest.mm 约定，显式兼容分支仍允许无槽位。
+  assert.deepEqual(
+    refreshMacIntegrity(frameworksDir, runnerAsarPath, { electronVersion: "40.0.0" }),
+    []
+  );
 });
 
 test(
@@ -1465,10 +1503,95 @@ test(
     fs.symlinkSync(externalBinary, path.join(frameworksDir, "External.framework", "External"));
 
     assert.throws(
-      () => refreshMacIntegrity(frameworksDir, runnerAsarPath),
+      () => refreshMacIntegrity(frameworksDir, runnerAsarPath, { electronVersion: "42.0.1" }),
       /escapes its cache directory/
     );
     assert.deepEqual(fs.readFileSync(externalBinary), externalData);
+  }
+);
+
+test(
+  "macOS runner rejects top-level app Contents and Frameworks symlinks",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    for (const target of ["app", "contents", "frameworks"]) {
+      const { root, runnerAsarPath } = await createIntegrityFixture(t);
+      const appRoot = path.join(root, "ChatGPT.app");
+      const layout = {
+        appRoot,
+        executablePath: path.join(appRoot, "Contents", "MacOS", "ChatGPT"),
+        asarPath: runnerAsarPath,
+        frameworksDir: path.join(appRoot, "Contents", "Frameworks"),
+      };
+      writeFile(layout.executablePath, "official executable");
+      fs.mkdirSync(layout.frameworksDir, { recursive: true });
+
+      const runtimeDir = path.join(root, "runtime");
+      const runnerRoot = path.join(runtimeDir, "official-electron-runner");
+      const runnerApp = path.join(runnerRoot, "OpenCodex Gateway.app");
+      const runnerContents = path.join(runnerApp, "Contents");
+      const runnerFrameworks = path.join(runnerContents, "Frameworks");
+      const external = path.join(root, "external-cache");
+      fs.mkdirSync(external, { recursive: true });
+      fs.mkdirSync(runnerRoot, { recursive: true });
+      if (target === "app") {
+        fs.symlinkSync(external, runnerApp, "dir");
+      } else if (target === "contents") {
+        fs.mkdirSync(runnerApp, { recursive: true });
+        fs.symlinkSync(external, runnerContents, "dir");
+      } else {
+        fs.mkdirSync(runnerContents, { recursive: true });
+        fs.symlinkSync(external, runnerFrameworks, "dir");
+      }
+
+      await assert.rejects(
+        createMacRunner({
+          layout,
+          runtimeDir,
+          logger() {},
+          codesign() {},
+          electronVersion: "42.0.1",
+        }),
+        /must not be a symbolic link/
+      );
+    }
+  }
+);
+
+test(
+  "macOS runner rejects external symlinks introduced by a fresh Framework copy",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const { root, runnerAsarPath } = await createIntegrityFixture(t);
+    const appRoot = path.join(root, "ChatGPT.app");
+    const layout = {
+      appRoot,
+      executablePath: path.join(appRoot, "Contents", "MacOS", "ChatGPT"),
+      asarPath: runnerAsarPath,
+      frameworksDir: path.join(appRoot, "Contents", "Frameworks"),
+    };
+    writeFile(layout.executablePath, "official executable");
+    fs.mkdirSync(path.join(layout.frameworksDir, "Codex.framework"), { recursive: true });
+    const external = path.join(root, "external-framework");
+    fs.mkdirSync(external);
+    fs.symlinkSync(external, path.join(layout.frameworksDir, "Escaped Link"), "dir");
+
+    const runtimeDir = path.join(root, "runtime");
+    await assert.rejects(
+      createMacRunner({
+        layout,
+        runtimeDir,
+        logger() {},
+        codesign() {},
+        electronVersion: "42.0.1",
+      }),
+      /contains an external symbolic link/
+    );
+    // 首次复制也不能把 marker 发布为可复用状态。
+    assert.equal(
+      fs.existsSync(path.join(runtimeDir, "official-electron-runner", "frameworks-manifest.json")),
+      false
+    );
   }
 );
 
@@ -1504,6 +1627,7 @@ test(
         runtimeDir,
         logger: (line) => logs.push(line),
         codesign,
+        electronVersion: "42.0.1",
       });
       if (run === 0) {
         const runnerFrameworksDir = path.join(
@@ -1533,7 +1657,13 @@ test(
         assert.deepEqual(fs.readFileSync(sourceBinaryPath), officialBinary);
         assert.match(codesignCalls[0].args.at(-1), /Codex Helper\.app$/);
         assert.equal(codesignCalls[1].args.at(-1), fs.realpathSync(runnerBinaryPath));
-        assert.match(codesignCalls[2].args.at(-1), /OpenCodex Gateway$/);
+        assert.match(codesignCalls[2].args.at(-1), /OpenCodex Gateway\.app$/);
+        assert.deepEqual(codesignCalls[3].args, [
+          "--verify",
+          "--deep",
+          "--strict",
+          path.join(runtimeDir, "official-electron-runner", "OpenCodex Gateway.app"),
+        ]);
 
         // 模拟旧缓存写出的外链，下一次构建必须重建副本且不沿该链接修改官方安装目录。
         const escapedTarget = path.join(root, "installed-framework");
@@ -1553,6 +1683,49 @@ test(
     assert.equal(fs.existsSync(path.join(rebuiltFrameworksDir, "Escaped Link")), false);
   }
 );
+
+test("macOS runner keeps a half-refreshed Framework cache out of ready state", async (t) => {
+  const { root, runnerAsarPath } = await createIntegrityFixture(t);
+  const appRoot = path.join(root, "ChatGPT.app");
+  const layout = {
+    appRoot,
+    executablePath: path.join(appRoot, "Contents", "MacOS", "ChatGPT"),
+    asarPath: runnerAsarPath,
+    frameworksDir: path.join(appRoot, "Contents", "Frameworks"),
+  };
+  writeFile(layout.executablePath, "official executable");
+  writeFile(
+    path.join(layout.frameworksDir, "Codex.framework", "Codex"),
+    Buffer.concat([integritySlot(1, 1), Buffer.from("framework")])
+  );
+  const runtimeDir = path.join(root, "runtime");
+  const logs = [];
+  let interruptAfterIntegrity = true;
+  const options = {
+    layout,
+    runtimeDir,
+    logger: (line) => logs.push(line),
+    codesign() {},
+    electronVersion: "42.0.1",
+    runCompatibility(point, operation) {
+      const result = operation();
+      if (point === runnerPoints.macosBackgroundBundle && interruptAfterIntegrity) {
+        interruptAfterIntegrity = false;
+        throw new Error("fixture interrupted after integrity refresh");
+      }
+      return result;
+    },
+  };
+
+  await assert.rejects(createMacRunner(options), /fixture interrupted after integrity refresh/);
+  const markerPath = path.join(runtimeDir, "official-electron-runner", "frameworks-manifest.json");
+  assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).status, "preparing");
+
+  await createMacRunner(options);
+  assert.equal(logs.filter((line) => line.includes("Frameworks copied:")).length, 2);
+  assert.equal(logs.some((line) => line.includes("Frameworks cache hit:")), false);
+  assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).status, "ready");
+});
 
 test("macOS runner invalidates the Framework cache when signing fails", async (t) => {
   const { root, runnerAsarPath } = await createIntegrityFixture(t);
@@ -1575,13 +1748,15 @@ test("macOS runner invalidates the Framework cache when signing fails", async (t
     layout,
     runtimeDir,
     logger: (line) => logs.push(line),
+    electronVersion: "42.0.1",
     codesign() {
       if (failSignature) throw new Error("fixture codesign failed");
     },
   };
 
   await assert.rejects(createMacRunner(options), /fixture codesign failed/);
-  assert.equal(fs.existsSync(path.join(runtimeDir, "official-electron-runner", "frameworks-manifest.json")), false);
+  const markerPath = path.join(runtimeDir, "official-electron-runner", "frameworks-manifest.json");
+  assert.notEqual(JSON.parse(fs.readFileSync(markerPath, "utf8")).status, "ready");
   failSignature = false;
   await createMacRunner(options);
   assert.equal(logs.filter((line) => line.includes("Frameworks copied:")).length, 2);

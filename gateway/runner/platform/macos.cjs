@@ -14,12 +14,76 @@ const {
   realpathSafe,
   readJsonIfPresent,
   withPhysicalAsarAccess,
-  writeJson,
 } = require("../shared/fs-utils.cjs");
 const { logLine } = require("../shared/logging.cjs");
 const { writeGatewayAsar } = require("../shared/runner-asar.cjs");
 const { pathIsInside, refreshMacIntegrity } = require("./macos-integrity.cjs");
 const { runner: runnerPoints } = require("../../runtime/modification/point-refs.cjs");
+
+const FRAMEWORKS_CACHE_SCHEMA_VERSION = 1;
+const FRAMEWORKS_CACHE_PREPARING = "preparing";
+const FRAMEWORKS_CACHE_READY = "ready";
+
+/** marker 必须原子替换，避免进程中断后读到半截 JSON 或被误判为 ready。 */
+function writeJsonAtomic(filePath, value) {
+  const directory = path.dirname(filePath);
+  fs.mkdirSync(directory, { recursive: true });
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`
+  );
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryPath, filePath);
+  } finally {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+    }
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {}
+  }
+}
+
+function frameworkCacheState(status, fingerprint) {
+  return {
+    schemaVersion: FRAMEWORKS_CACHE_SCHEMA_VERSION,
+    status,
+    fingerprint,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function writeFrameworkCacheState(markerPath, status, fingerprint) {
+  writeJsonAtomic(markerPath, frameworkCacheState(status, fingerprint));
+}
+
+function assertNotSymbolicLink(filePath, label) {
+  try {
+    if (fs.lstatSync(filePath).isSymbolicLink()) {
+      throw new Error(`Runner ${label} must not be a symbolic link: ${filePath}`);
+    }
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function assertInsideTrustedContents(trustedContentsDir, candidatePath, label) {
+  const trustedRealPath = fs.realpathSync(trustedContentsDir);
+  const candidateRealPath = fs.realpathSync(candidatePath);
+  if (!pathIsInside(trustedRealPath, candidateRealPath)) {
+    throw new Error(`Runner ${label} escapes Contents: ${candidatePath}`);
+  }
+  return candidateRealPath;
+}
 
 function escapePlistString(value) {
   return String(value || "")
@@ -85,7 +149,7 @@ function officialFrameworksFingerprint(layout) {
   } catch {}
   return {
     // 旧缓存可能包含 cpSync 改写出的官方绝对链接，升级后必须强制重建一次。
-    copyVersion: 3,
+    copyVersion: 4,
     source: realpathSafe(layout.frameworksDir),
     appRoot: realpathSafe(layout.appRoot),
     executable: fileFingerprint(layout.executablePath),
@@ -98,18 +162,21 @@ function sameFrameworksFingerprint(left, right) {
   return JSON.stringify(left || null) === JSON.stringify(right || null);
 }
 
-function hasExternalSymlinks(dirPath, rootDir = dirPath) {
+function hasExternalSymlinks(dirPath, rootDir) {
   const lexicalRoot = path.resolve(rootDir);
   let realRoot = lexicalRoot;
+  let currentDir = dirPath;
   try {
     realRoot = fs.realpathSync(rootDir);
+    // 遍历路径同样规范化，避免 runtimeDir 自身含链接或大小写差异时误判合法相对链接。
+    currentDir = fs.realpathSync(dirPath);
   } catch {
     return true;
   }
 
   try {
-    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-      const fullPath = path.join(dirPath, entry.name);
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = path.join(currentDir, entry.name);
       if (entry.isSymbolicLink()) {
         const target = fs.readlinkSync(fullPath);
         const lexicalTarget = path.resolve(path.dirname(fullPath), target);
@@ -179,17 +246,29 @@ function signChangedFrameworkCopies({ changedFrameworks, runnerFrameworksDir, co
   }
 }
 
-function ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath, logger }) {
+function ensureFrameworksCopy({
+  layout,
+  runnerFrameworksDir,
+  trustedContentsDir,
+  markerPath,
+  logger,
+}) {
   const nextFingerprint = officialFrameworksFingerprint(layout);
   const previous = readJsonIfPresent(markerPath);
+  assertNotSymbolicLink(runnerFrameworksDir, "Frameworks");
   if (
     previous &&
+    previous.schemaVersion === FRAMEWORKS_CACHE_SCHEMA_VERSION &&
+    previous.status === FRAMEWORKS_CACHE_READY &&
     sameFrameworksFingerprint(previous.fingerprint, nextFingerprint) &&
     isDirectory(runnerFrameworksDir) &&
-    !hasExternalSymlinks(runnerFrameworksDir, runnerFrameworksDir)
+    assertInsideTrustedContents(trustedContentsDir, runnerFrameworksDir, "Frameworks") &&
+    !hasExternalSymlinks(runnerFrameworksDir, trustedContentsDir)
   ) {
     logLine(logger, `official Electron Frameworks cache hit: ${runnerFrameworksDir}`);
-    return { copied: false };
+    // 命中后立即降级为 preparing；任何后续中断都会迫使下次重建，不能复用半摘要缓存。
+    writeFrameworkCacheState(markerPath, FRAMEWORKS_CACHE_PREPARING, nextFingerprint);
+    return { copied: false, fingerprint: nextFingerprint };
   }
 
   /**
@@ -206,20 +285,28 @@ function ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath, logger 
     force: true,
     verbatimSymlinks: true,
   });
-  writeJson(markerPath, {
-    fingerprint: nextFingerprint,
-    copiedAt: new Date().toISOString(),
-  });
+  assertNotSymbolicLink(runnerFrameworksDir, "Frameworks");
+  assertInsideTrustedContents(trustedContentsDir, runnerFrameworksDir, "Frameworks");
+  // 新复制出的任意外链也必须在写 ready 前拒绝，不能只在下一次 cache hit 时检查。
+  if (hasExternalSymlinks(runnerFrameworksDir, trustedContentsDir)) {
+    throw new Error(`Runner Frameworks copy contains an external symbolic link: ${runnerFrameworksDir}`);
+  }
+  writeFrameworkCacheState(markerPath, FRAMEWORKS_CACHE_PREPARING, nextFingerprint);
   logLine(logger, `official Electron Frameworks copied: ${layout.frameworksDir} -> ${runnerFrameworksDir}`);
-  return { copied: true };
+  return { copied: true, fingerprint: nextFingerprint };
 }
 
-function signRunnerExecutable(executablePath, codesign) {
+function signRunnerBundle(runnerAppPath, codesign) {
   /**
-   * 官方主二进制复制到 runner 后原签名会失效；最后重签入口壳，
-   * 让 Info.plist、app.asar 和已刷新的 Framework 一起封存到本地临时签名中。
+   * 最后签完整 app bundle，让 Info.plist、app.asar 和已刷新的 Framework
+   * 一起封存到本地临时签名中，而不是只签孤立的入口二进制。
    */
-  runCodesign(codesign, ["--force", "--sign", "-", executablePath]);
+  runCodesign(codesign, ["--force", "--sign", "-", runnerAppPath]);
+}
+
+function verifyRunnerBundle(runnerAppPath, codesign) {
+  // 签名命令成功不等于嵌套签名完整；构建返回前必须做 deep strict 验证。
+  runCodesign(codesign, ["--verify", "--deep", "--strict", runnerAppPath]);
 }
 
 async function createMacRunner({
@@ -228,6 +315,7 @@ async function createMacRunner({
   logger,
   runCompatibility = (_point, operation) => operation(),
   codesign = execFileSync,
+  electronVersion = process.versions.electron,
 }) {
   const workDir = path.join(runtimeDir, "official-electron-runner");
   const runnerAppPath = path.join(workDir, RUNNER_APP_NAME);
@@ -238,16 +326,29 @@ async function createMacRunner({
   const frameworksMarkerPath = path.join(workDir, "frameworks-manifest.json");
   const runnerExecutablePath = path.join(runnerMacosDir, RUNNER_EXECUTABLE_NAME);
 
+  // 所有信任根在删除或写入前先拒绝顶层 symlink，防止 rm/cp/codesign 穿过 runner 边界。
+  assertNotSymbolicLink(runnerAppPath, "app");
+  assertNotSymbolicLink(contentsDir, "Contents");
+  assertNotSymbolicLink(runnerFrameworksDir, "Frameworks");
   // 官方升级后 framework/ABI 可能变化，Frameworks 由 fingerprint 控制；入口和 app.asar 每次重写。
   fs.rmSync(runnerMacosDir, { recursive: true, force: true });
   fs.rmSync(runnerResourcesDir, { recursive: true, force: true });
   fs.mkdirSync(runnerMacosDir, { recursive: true });
   fs.mkdirSync(runnerResourcesDir, { recursive: true });
+  const trustedContentsDir = fs.realpathSync(contentsDir);
 
   fs.copyFileSync(layout.executablePath, runnerExecutablePath);
   fs.chmodSync(runnerExecutablePath, 0o755);
-  ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath: frameworksMarkerPath, logger });
+  const frameworkCache = ensureFrameworksCopy({
+    layout,
+    runnerFrameworksDir,
+    trustedContentsDir,
+    markerPath: frameworksMarkerPath,
+    logger,
+  });
   let changedFrameworks = [];
+  let integrityRefreshed = false;
+  let runnerSignatureVerified = false;
   try {
     // ASAR 完成后才能生成包含最终哈希的 plist；Framework 摘要和签名必须放在这两步之后。
     const runnerAsarPath = await runCompatibility(
@@ -259,7 +360,10 @@ async function createMacRunner({
       () => {
         fs.writeFileSync(path.join(contentsDir, "Info.plist"), runnerInfoPlist(runnerAsarPath), "utf8");
         fs.writeFileSync(path.join(contentsDir, "PkgInfo"), "APPL????", "utf8");
-        changedFrameworks = refreshMacIntegrity(runnerFrameworksDir, runnerAsarPath);
+        changedFrameworks = refreshMacIntegrity(runnerFrameworksDir, runnerAsarPath, {
+          electronVersion,
+        });
+        integrityRefreshed = true;
       }
     );
     runCompatibility(
@@ -271,12 +375,29 @@ async function createMacRunner({
           codesign,
           logger,
         });
-        signRunnerExecutable(runnerExecutablePath, codesign);
+        signRunnerBundle(runnerAppPath, codesign);
+        verifyRunnerBundle(runnerAppPath, codesign);
+        runnerSignatureVerified = true;
       }
     );
+    if (!integrityRefreshed || !runnerSignatureVerified) {
+      throw new Error("macOS runner integrity or signature verification did not execute");
+    }
+    // 只有完整性摘要、嵌套签名和最终 bundle 验证全部成功后才发布 ready。
+    writeFrameworkCacheState(
+      frameworksMarkerPath,
+      FRAMEWORKS_CACHE_READY,
+      frameworkCache.fingerprint
+    );
   } catch (error) {
-    // 摘要写入后签名若失败，下次必须从官方副本重建，不能误用半成品缓存。
-    fs.rmSync(frameworksMarkerPath, { force: true });
+    // marker 在构建开始时已降级为 preparing；尽力重写一次，确保异常路径也不会留下 ready。
+    try {
+      writeFrameworkCacheState(
+        frameworksMarkerPath,
+        FRAMEWORKS_CACHE_PREPARING,
+        frameworkCache.fingerprint
+      );
+    } catch {}
     throw error;
   }
 

@@ -9,6 +9,8 @@ const INTEGRITY_DIGEST_SENTINEL = Buffer.from("AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A"
 const INTEGRITY_DIGEST_OFFSET = INTEGRITY_DIGEST_SENTINEL.length + 2;
 const INTEGRITY_DIGEST_LENGTH = 32;
 const INTEGRITY_SLOT_LENGTH = INTEGRITY_DIGEST_OFFSET + INTEGRITY_DIGEST_LENGTH;
+// Electron 41 开始启用 macOS Framework 内的 ASAR 完整性摘要槽；更早版本只能显式走兼容分支。
+const FIRST_ELECTRON_VERSION_WITH_MAC_INTEGRITY = 41;
 
 function pathIsInside(rootPath, candidatePath) {
   const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
@@ -21,6 +23,19 @@ function realPathInside(rootPath, candidatePath, label) {
     throw new Error(`Runner ${label} escapes its cache directory: ${candidatePath}`);
   }
   return realPath;
+}
+
+function electronMajorVersion(version) {
+  const major = Number.parseInt(String(version || "").split(".")[0], 10);
+  return Number.isInteger(major) && major >= 0 ? major : null;
+}
+
+function requiresMacIntegritySlots(electronVersion) {
+  const major = electronMajorVersion(electronVersion);
+  if (major === null) {
+    throw new Error(`Cannot determine Electron version for macOS integrity validation: ${electronVersion || "unknown"}`);
+  }
+  return major >= FIRST_ELECTRON_VERSION_WITH_MAC_INTEGRITY;
 }
 
 function runnerAsarDictionaryDigest(runnerAsarPath) {
@@ -74,9 +89,16 @@ function frameworkBinaryPaths(frameworksDir) {
   return [...binaries.keys()];
 }
 
-function refreshMacIntegrity(frameworksDir, runnerAsarPath) {
+function refreshMacIntegrity(
+  frameworksDir,
+  runnerAsarPath,
+  { electronVersion = process.versions.electron } = {}
+) {
   const digest = runnerAsarDictionaryDigest(runnerAsarPath);
   const updates = [];
+  let activeSlotCount = 0;
+  // 版本边界必须显式：Electron 41+ 缺失全部 active 槽位时不能静默绕过 ASAR 校验。
+  const requireSlots = requiresMacIntegritySlots(electronVersion);
 
   for (const binaryPath of frameworkBinaryPaths(frameworksDir)) {
     const binary = fs.readFileSync(binaryPath);
@@ -97,6 +119,7 @@ function refreshMacIntegrity(frameworksDir, runnerAsarPath) {
       if (version !== 1) {
         throw new Error(`Unsupported macOS integrity digest version ${version}: ${binaryPath}`);
       }
+      activeSlotCount += 1;
       const digestOffset = offset + INTEGRITY_DIGEST_OFFSET;
       if (!binary.subarray(digestOffset, digestOffset + INTEGRITY_DIGEST_LENGTH).equals(digest)) {
         digest.copy(updated, digestOffset);
@@ -108,13 +131,18 @@ function refreshMacIntegrity(frameworksDir, runnerAsarPath) {
     if (dirty) updates.push({ binaryPath, data: updated });
   }
 
+  if (requireSlots && activeSlotCount === 0) {
+    throw new Error(`Electron ${electronVersion} requires an active macOS integrity digest slot`);
+  }
   for (const update of updates) fs.writeFileSync(update.binaryPath, update.data);
   return updates.map((update) => update.binaryPath);
 }
 
 module.exports = {
+  FIRST_ELECTRON_VERSION_WITH_MAC_INTEGRITY,
   INTEGRITY_DIGEST_SENTINEL,
   pathIsInside,
   refreshMacIntegrity,
+  requiresMacIntegritySlots,
   runnerAsarDictionaryDigest,
 };
