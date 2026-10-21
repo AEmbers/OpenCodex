@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.1.2
+
+### Fixed
+
+- Prefer the real Statsig initialize response when the network is healthy and fall back locally only for aborts handled by OpenCodex, network failures, timeouts, non-2xx responses, or malformed control-plane payloads.
+- Keep IPC Statsig requests to one terminal response, cancel timed-out native requests, and retry bounded fallback delivery without leaving the first-screen promise unresolved.
+- Restore immutable caching for verified Vite and WASM content hashes while keeping fixed-name JavaScript and entry HTML revalidated.
+- Route same-origin refresh and gateway links in the current tab instead of opening a second browser window.
+- Serialize composer draft persistence so delayed acknowledgements cannot restore sent text or overwrite a newer clear.
+- Refresh macOS runner integrity slots and signatures fail-closed, reject cache symlink escapes, and never reuse a half-prepared Framework cache.
+- Stop repeated macOS launcher focus stealing during startup and background transitions.
+- Persist the selected authentication theme before first paint and follow the system theme when no preference exists.
+- Scope mobile subscription billing suppression to the exact payment endpoint and error text.
+- Support delegated worktree shell-environment layouts without rewriting ambiguous official bundle code.
+
+### Changed
+
+- Make headless Electron arguments opt-in through `OPENCODEX_HEADLESS_ELECTRON`.
+- Follow the configured Fork repository for release checks and trusted release links.
+
 ## 2.1.1
 
 ### Fixed
