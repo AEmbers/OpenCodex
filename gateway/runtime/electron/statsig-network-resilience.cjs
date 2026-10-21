@@ -107,7 +107,13 @@ function statsigResponseError(reason, message) {
 function extractAbortSignalFromFetchArgs(args) {
   const first = args?.[0];
   const init = args?.[1];
-  const signal = init && typeof init === "object" ? init.signal : first?.signal;
+  // init 只有显式拥有 signal 属性时才覆盖 Request.signal；空对象和仅 headers 的 init 不能丢失 Request 自身信号。
+  const signal =
+    init &&
+    typeof init === "object" &&
+    Object.prototype.hasOwnProperty.call(init, "signal")
+      ? init.signal
+      : first?.signal;
   return signal && typeof signal.addEventListener === "function" ? signal : null;
 }
 
@@ -383,6 +389,7 @@ function createStatsigIpcFallbackCoordinator({
   policy,
   sendFallback,
   onFallback = () => {},
+  onDeliveryFailure = () => {},
   now = Date.now,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
@@ -391,8 +398,38 @@ function createStatsigIpcFallbackCoordinator({
   const pending = new Map();
   const fallbackCompleted = new Map();
   const successCompleted = new Map();
-  const failedDeliveries = new Map();
+  const terminalFailures = new Map();
   const maxDeliveryAttempts = 3;
+
+  function createCompletion(requestId) {
+    let resolveCompletion;
+    let rejectCompletion;
+    const completion = new Promise((resolve, reject) => {
+      resolveCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    // 调用方可以选择稍后 await；内部先挂 catch，避免页面切换时形成 unhandled rejection。
+    completion.catch(() => {});
+    return {
+      completion,
+      reject(error) {
+        rejectCompletion(error);
+      },
+      resolve(value = true) {
+        resolveCompletion(value);
+      },
+    };
+  }
+
+  function deliveryFailureError(entry) {
+    const error = new Error(
+      `Statsig fallback delivery failed after ${entry.deliveryAttempts} attempts`
+    );
+    error.code = "STATSIG_FALLBACK_DELIVERY_FAILED";
+    error.reason = entry.reason;
+    error.requestId = entry.requestId;
+    return error;
+  }
 
   function rememberFallbackCompleted(requestId) {
     fallbackCompleted.delete(requestId);
@@ -418,18 +455,20 @@ function createStatsigIpcFallbackCoordinator({
     return entry;
   }
 
-  function rememberFailedDelivery(entry) {
-    failedDeliveries.delete(entry.requestId);
-    failedDeliveries.set(entry.requestId, {
-      deliveryFailures: entry.deliveryFailures || 1,
+  function rememberTerminalFailure(entry, error) {
+    terminalFailures.delete(entry.requestId);
+    terminalFailures.set(entry.requestId, {
+      deliveryAttempts: entry.deliveryAttempts || maxDeliveryAttempts,
+      errorCode: error.code,
+      errorMessage: error.message,
       kind: entry.kind || "initialize",
-      message: entry.message,
       reason: entry.reason,
       recordedAt: now(),
       requestId: entry.requestId,
+      terminal: true,
     });
-    while (failedDeliveries.size > STATSIG_IPC_FALLBACK_TOMBSTONE_MAX_ENTRIES) {
-      failedDeliveries.delete(failedDeliveries.keys().next().value);
+    while (terminalFailures.size > STATSIG_IPC_FALLBACK_TOMBSTONE_MAX_ENTRIES) {
+      terminalFailures.delete(terminalFailures.keys().next().value);
     }
   }
 
@@ -446,14 +485,25 @@ function createStatsigIpcFallbackCoordinator({
     return delivered;
   }
 
+  function finalizeDeliveryFailure(entry, minimumAttempts = 0) {
+    entry.deliveryAttempts = Math.max(minimumAttempts, entry.deliveryAttempts || 0);
+    clearPending(entry.requestId);
+    const error = deliveryFailureError(entry);
+    rememberTerminalFailure(entry, error);
+    entry.completion.reject(error);
+    try {
+      onDeliveryFailure({ error, kind: entry.kind, reason: entry.reason, requestId: entry.requestId });
+    } catch {}
+    return error;
+  }
+
   function deliver(entry) {
     if (pending.get(entry.requestId) !== entry) return false;
     if (entry.timer != null) clearTimer(entry.timer);
     entry.timer = null;
     const response = buildStatsigFetchResponseMessage(entry.message, "initialize");
     if (!response) {
-      rememberFailedDelivery({ ...entry, deliveryFailures: 1 });
-      clearPending(entry.requestId);
+      finalizeDeliveryFailure(entry, maxDeliveryAttempts);
       return false;
     }
     const delivered = trySendResponse(response, {
@@ -464,36 +514,45 @@ function createStatsigIpcFallbackCoordinator({
     if (delivered) {
       clearPending(entry.requestId);
       fallbackCompleted.delete(entry.requestId);
+      terminalFailures.delete(entry.requestId);
       rememberFallbackCompleted(entry.requestId);
+      entry.completion.resolve(true);
       return true;
     }
 
-    entry.deliveryFailures = (entry.deliveryFailures || 0) + 1;
+    entry.deliveryAttempts = (entry.deliveryAttempts || 0) + 1;
     entry.deliveryState = "delivery_failed";
-    rememberFailedDelivery(entry);
-    if (entry.deliveryFailures < maxDeliveryAttempts && pending.get(entry.requestId) === entry) {
+    if (entry.deliveryAttempts < maxDeliveryAttempts && pending.get(entry.requestId) === entry) {
       schedule(entry, now() + policy.initializeDelayMs);
+      return false;
     }
+
+    finalizeDeliveryFailure(entry);
     return false;
   }
 
-  function schedule(entry, dueAt = entry.startedAt + entry.delayMs) {
+  function schedule(entry, dueAt = entry.deadlineAt) {
     while (pending.size >= maxPending) {
       // 达到上限时先尝试完成最老请求；若投递失败则把状态移入有界可恢复记录，避免无限占位。
       const oldest = pending.values().next().value;
       if (!oldest || deliver(oldest)) break;
       if (pending.get(oldest.requestId) === oldest) {
-        const failed = clearPending(oldest.requestId);
-        if (failed) rememberFailedDelivery(failed);
+        finalizeDeliveryFailure(oldest, maxDeliveryAttempts);
       }
     }
     const previous = pending.get(entry.requestId);
     if (previous?.timer != null) clearTimer(previous.timer);
     const remainingMs = Math.max(0, dueAt - now());
     entry.deliveryState = "pending";
+    entry.dueAt = dueAt;
     entry.timer = setTimer(() => deliver(entry), remainingMs);
     entry.timer?.unref?.();
     pending.set(entry.requestId, entry);
+  }
+
+  function scheduleEarlier(entry, dueAt) {
+    if (entry.dueAt != null && entry.dueAt <= dueAt) return;
+    schedule(entry, dueAt);
   }
 
   function beforeInvoke(channel, messageChannel, args) {
@@ -511,15 +570,6 @@ function createStatsigIpcFallbackCoordinator({
         reason: kind,
         requestId: response.requestId,
       });
-      if (!delivered) {
-        rememberFailedDelivery({
-          deliveryFailures: 1,
-          kind,
-          message,
-          reason: kind,
-          requestId: response.requestId,
-        });
-      }
       return {
         handled: delivered,
         deliveryFailed: !delivered,
@@ -529,26 +579,27 @@ function createStatsigIpcFallbackCoordinator({
     }
 
     const startedAt = now();
+    const completion = createCompletion(response.requestId);
+    const fallbackDelayMs = policy.initializeDelayMs;
     const entry = {
-      delayMs: policy.initializeDelayMs,
+      completion,
+      deadlineAt: startedAt + fallbackDelayMs,
       message,
       reason: policy.offlineFallback ? "offline" : "timeout",
       requestId: response.requestId,
       startedAt,
       timer: null,
-      deliveryFailures: 0,
+      deliveryAttempts: 0,
       deliveryState: "pending",
       kind: "initialize",
+      timeoutAt: startedAt + Math.max(policy.initializeTimeoutMs, policy.initializeDelayMs),
     };
+    schedule(entry, policy.offlineFallback ? entry.deadlineAt : entry.timeoutAt);
     if (policy.offlineFallback) {
-      schedule(entry);
-      return { handled: true, kind, requestId: entry.requestId };
+      return { handled: true, kind, requestId: entry.requestId, completion: completion.completion };
     }
-
     // 在线模式继续调用官方 handler；仅登记超时兜底，真实成功响应会在出站阶段取消它。
-    entry.delayMs = Math.max(policy.initializeTimeoutMs, policy.initializeDelayMs);
-    schedule(entry);
-    return { handled: false, kind, requestId: entry.requestId };
+    return { handled: false, kind, requestId: entry.requestId, completion: completion.completion };
   }
 
   function observeOutgoing(channel, messageChannel, args) {
@@ -557,15 +608,23 @@ function createStatsigIpcFallbackCoordinator({
     const requestId = String(response?.requestId || "");
     if (!requestId) return { suppress: false };
     if (fallbackCompleted.has(requestId)) return { suppress: true, requestId };
+    const validSuccess =
+      response.responseType === "success" &&
+      isConsumableStatsigInitializeFetchResponse(response);
+    if (terminalFailures.has(requestId)) {
+      if (!validSuccess) return { suppress: true, requestId };
+      // terminal tombstone 只阻止迟到错误；真实合法 success 仍可作为唯一最终结果放行。
+      terminalFailures.delete(requestId);
+      rememberSuccessCompleted(requestId);
+      return { suppress: false, requestId };
+    }
     const entry = pending.get(requestId);
     if (!entry) return { suppress: false };
 
-    if (
-      response.responseType === "success" &&
-      isConsumableStatsigInitializeFetchResponse(response)
-    ) {
+    if (validSuccess) {
       clearPending(requestId);
       rememberSuccessCompleted(requestId);
+      entry.completion.resolve(true);
       return { suppress: false, requestId };
     }
 
@@ -580,9 +639,7 @@ function createStatsigIpcFallbackCoordinator({
           ? `http_${status}`
           : "malformed_response"
         : "network_error";
-    entry.delayMs = Math.max(entry.startedAt + policy.initializeDelayMs - now(), 0);
-    entry.startedAt = now();
-    schedule(entry);
+    scheduleEarlier(entry, Math.max(entry.deadlineAt, now()));
     return { suppress: true, requestId };
   }
 
@@ -591,32 +648,36 @@ function createStatsigIpcFallbackCoordinator({
     if (fallbackCompleted.has(requestId) || successCompleted.has(requestId)) {
       return { handled: true, alreadySettled: true, requestId };
     }
+    if (terminalFailures.has(requestId)) {
+      return { handled: true, alreadyTerminal: true, requestId };
+    }
     const entry = requestId ? pending.get(requestId) : null;
     if (!entry) return { handled: false, requestId };
-    // 已经由网络错误、非法响应或前一次 handler failure 排好的统一 deadline 不能被重复延后。
-    if (entry.reason !== "timeout") {
-      return { handled: true, alreadyScheduled: true, requestId };
-    }
+    // 晚到的 handler failure 只更新诊断原因；首次 deadlineAt 已固定，不能顺延 fallback。
     entry.reason = "handler_error";
     entry.errorMessage = error instanceof Error ? error.message : String(error || "");
-    entry.delayMs = Math.max(entry.startedAt + policy.initializeDelayMs - now(), 0);
-    entry.startedAt = now();
-    schedule(entry);
-    return { handled: true, requestId };
+    scheduleEarlier(entry, Math.max(entry.deadlineAt, now()));
+    return { handled: true, requestId, completion: entry.completion.completion };
   }
 
   function finalizeRequest(requestId) {
-    return clearPending(String(requestId || ""));
+    const entry = clearPending(String(requestId || ""));
+    entry?.completion.resolve(false);
+    return entry;
   }
 
   function dispose() {
     for (const entry of pending.values()) {
       if (entry.timer != null) clearTimer(entry.timer);
+      const error = new Error("Statsig fallback was disposed");
+      error.code = "STATSIG_FALLBACK_DISPOSED";
+      error.requestId = entry.requestId;
+      entry.completion.reject(error);
     }
     pending.clear();
     fallbackCompleted.clear();
     successCompleted.clear();
-    failedDeliveries.clear();
+    terminalFailures.clear();
   }
 
   return {
@@ -630,13 +691,17 @@ function createStatsigIpcFallbackCoordinator({
       const entry = pending.get(String(requestId || ""));
       return entry
         ? {
-            deliveryFailures: entry.deliveryFailures || 0,
+            deliveryAttempts: entry.deliveryAttempts || 0,
             deliveryState: entry.deliveryState,
+            deadlineAt: entry.deadlineAt,
+            dueAt: entry.dueAt,
             reason: entry.reason,
+            timeoutAt: entry.timeoutAt,
           }
         : null;
     },
-    failedDeliveryState: (requestId) => failedDeliveries.get(String(requestId || "")) || null,
+    failedDeliveryState: (requestId) => terminalFailures.get(String(requestId || "")) || null,
+    terminalFailureState: (requestId) => terminalFailures.get(String(requestId || "")) || null,
   };
 }
 

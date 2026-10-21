@@ -1517,6 +1517,14 @@ const statsigIpcFallbackCoordinator = createStatsigIpcFallbackCoordinator({
     diagnosticLog("statsig-ipc", "fallback_prepared", { kind, reason });
     recordRuntimeCompatibilityHit(gatewayPointRefs.netFetchStatsig);
   },
+  onDeliveryFailure({ error, kind, reason }) {
+    // 原 IPC invoke 会收到同一个错误；这里再落一条诊断，便于区分网络故障和正常 fallback。
+    diagnosticWarn("statsig-ipc", "fallback_delivery_failed", {
+      code: error?.code || "",
+      kind,
+      reason,
+    });
+  },
   sendFallback(response) {
     // 合成响应本身也要经过统一 WS 路由，但不能再次被出站观察器当成官方回包吞掉。
     return routeOfficialWebContentsSend(
@@ -2229,15 +2237,23 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
     MESSAGE_FROM_VIEW_CHANNEL,
     invokeArgs
   );
-  if (statsigDispatch.handled) return true;
+  if (statsigDispatch.handled) {
+    if (statsigDispatch.completion) await statsigDispatch.completion;
+    return true;
+  }
   logDesktopFeatureAvailability(channel, invokeArgs);
   const handler = officialIpc.handlers.get(channel);
   if (handler) {
     try {
-      return await handler(event, ...invokeArgs);
+      const result = await handler(event, ...invokeArgs);
+      if (statsigDispatch.completion) await statsigDispatch.completion;
+      return result;
     } catch (error) {
       // handler 失败后只保留一个终态：已登记 Statsig initialize 时转为延迟合成响应并吞掉 IPC 异常。
-      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) return true;
+      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) {
+        if (statsigDispatch.completion) await statsigDispatch.completion;
+        return true;
+      }
       throw error;
     }
   }
@@ -2247,8 +2263,12 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
       for (const listener of [...listeners]) {
         await listener(event, ...invokeArgs);
       }
+      if (statsigDispatch.completion) await statsigDispatch.completion;
     } catch (error) {
-      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) return true;
+      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) {
+        if (statsigDispatch.completion) await statsigDispatch.completion;
+        return true;
+      }
       throw error;
     }
     return event.returnValue === undefined ? true : event.returnValue;
@@ -2262,6 +2282,7 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
   });
   const missingHandlerError = new Error(`No official Electron IPC handler for ${channel}`);
   if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, missingHandlerError).handled) {
+    if (statsigDispatch.completion) await statsigDispatch.completion;
     return true;
   }
   throw missingHandlerError;

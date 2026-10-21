@@ -242,6 +242,32 @@ test("Statsig net.fetch timeout aborts the native request before returning fallb
   assert.equal(intercepted.at(-1).reason, "timeout");
 });
 
+test("Statsig net.fetch preserves Request.signal when init has no signal property", async (t) => {
+  for (const init of [{}, { headers: { "x-statsig-client": "test" } }]) {
+    let nativeSignal = null;
+    const harness = createStatsigNetHarness(t, {
+      fetch: (_request, nativeInit) =>
+        new Promise((_resolve, reject) => {
+          nativeSignal = nativeInit.signal;
+          nativeInit.signal.addEventListener("abort", () => reject(nativeInit.signal.reason), {
+            once: true,
+          });
+        }),
+    });
+    const controller = new AbortController();
+    const request = new Request("https://ab.chatgpt.com/v1/initialize", {
+      method: "POST",
+      signal: controller.signal,
+    });
+    const pending = harness.hookedNet.fetch(request, init);
+    await Promise.resolve();
+    controller.abort();
+    await assert.rejects(pending, (error) => error?.name === "AbortError");
+    assert.equal(nativeSignal.aborted, true);
+    assert.equal(harness.intercepted.length, 0);
+  }
+});
+
 test("Statsig timing policy rejects invalid values and caps oversized environment values", () => {
   const safe = resolveStatsigNetworkPolicy({
     OPENCODEX_STATSIG_INITIALIZE_DELAY_MS: "invalid",
@@ -268,7 +294,7 @@ test("Statsig timing policy rejects invalid values and caps oversized environmen
   assert.equal(bounded.offlineFallback, true);
 });
 
-test("Statsig IPC coordinator preserves success and emits bounded fallback protocol", () => {
+test("Statsig IPC coordinator preserves success and emits bounded fallback protocol", async () => {
   const clock = createFakeStatsigClock();
   const sent = [];
   const createCoordinator = (offlineFallback = false) =>
@@ -295,11 +321,10 @@ test("Statsig IPC coordinator preserves success and emits bounded fallback proto
 
   const online = createCoordinator();
   const successfulDispatch = online.beforeInvoke(channel, channel, [initializeMessage]);
-  assert.deepEqual(successfulDispatch, {
-    handled: false,
-    kind: "initialize",
-    requestId: "request-1",
-  });
+  assert.equal(successfulDispatch.handled, false);
+  assert.equal(successfulDispatch.kind, "initialize");
+  assert.equal(successfulDispatch.requestId, "request-1");
+  assert.ok(successfulDispatch.completion instanceof Promise);
   assert.deepEqual(
     online.observeOutgoing(channel, channel, [
       {
@@ -312,6 +337,7 @@ test("Statsig IPC coordinator preserves success and emits bounded fallback proto
     ]),
     { suppress: false, requestId: "request-1" }
   );
+  assert.equal(await successfulDispatch.completion, true);
   assert.equal(
     online.handlerFailed(successfulDispatch, new Error("late handler rejection")).alreadySettled,
     true
@@ -428,7 +454,62 @@ test("Statsig IPC invalid initialize responses use the same 400ms fallback deadl
   }
 });
 
-test("Statsig IPC handler rejection finalizes to one fallback response", () => {
+test("Statsig IPC late failures only update reason and keep the first fallback deadline", () => {
+  const clock = createFakeStatsigClock();
+  const sent = [];
+  const coordinator = createStatsigIpcFallbackCoordinator({
+    policy: { initializeDelayMs: 100, initializeTimeoutMs: 300, offlineFallback: false },
+    sendFallback: (response, details) => {
+      sent.push({ response, details });
+      return true;
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const channel = "message-from-view";
+  const dispatch = coordinator.beforeInvoke(channel, channel, [
+    {
+      type: "fetch",
+      requestId: "immutable-deadline",
+      url: "https://ab.chatgpt.com/v1/initialize",
+    },
+  ]);
+  assert.equal(coordinator.pendingState(dispatch.requestId).deadlineAt, 100);
+
+  clock.advance(40);
+  coordinator.observeOutgoing(channel, channel, [
+    { type: "fetch-response", requestId: dispatch.requestId, responseType: "error" },
+  ]);
+  clock.advance(30);
+  coordinator.observeOutgoing(channel, channel, [
+    {
+      type: "fetch-response",
+      requestId: dispatch.requestId,
+      responseType: "success",
+      status: 200,
+      bodyJsonString: "{}",
+    },
+  ]);
+  clock.advance(20);
+  coordinator.handlerFailed(dispatch, new Error("late handler failure"));
+
+  assert.deepEqual(
+    {
+      deadlineAt: coordinator.pendingState(dispatch.requestId).deadlineAt,
+      dueAt: coordinator.pendingState(dispatch.requestId).dueAt,
+      reason: coordinator.pendingState(dispatch.requestId).reason,
+    },
+    { deadlineAt: 100, dueAt: 100, reason: "handler_error" }
+  );
+  clock.advance(9);
+  assert.equal(sent.length, 0);
+  clock.advance(1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].details.reason, "handler_error");
+});
+
+test("Statsig IPC handler rejection finalizes to one fallback response", async () => {
   const clock = createFakeStatsigClock();
   const sent = [];
   const coordinator = createStatsigIpcFallbackCoordinator({
@@ -450,21 +531,21 @@ test("Statsig IPC handler rejection finalizes to one fallback response", () => {
     },
   ]);
   clock.advance(25);
-  assert.deepEqual(coordinator.handlerFailed(dispatch, new Error("handler rejected")), {
-    handled: true,
-    requestId: "handler-rejected",
-  });
+  const handlerFailure = coordinator.handlerFailed(dispatch, new Error("handler rejected"));
+  assert.equal(handlerFailure.handled, true);
+  assert.equal(handlerFailure.requestId, "handler-rejected");
   assert.equal(coordinator.handlerFailed(dispatch, new Error("duplicate rejection")).handled, true);
   clock.advance(74);
   assert.equal(sent.length, 0);
   clock.advance(1);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].details.reason, "handler_error");
+  assert.equal(await dispatch.completion, true);
   clock.advance(500);
   assert.equal(sent.length, 1, "handler rejection must not emit IPC error plus a later success");
 });
 
-test("Statsig IPC keeps failed fallback deliveries recoverable until a real send succeeds", () => {
+test("Statsig IPC keeps failed fallback deliveries recoverable until a real send succeeds", async () => {
   const clock = createFakeStatsigClock();
   const attempts = [];
   const coordinator = createStatsigIpcFallbackCoordinator({
@@ -490,23 +571,99 @@ test("Statsig IPC keeps failed fallback deliveries recoverable until a real send
   clock.advance(100);
   assert.equal(attempts.length, 1);
   assert.deepEqual(coordinator.pendingState("send-retry"), {
-    deliveryFailures: 1,
+    deliveryAttempts: 1,
     deliveryState: "pending",
+    deadlineAt: 100,
+    dueAt: 200,
     reason: "offline",
+    timeoutAt: 200,
   });
-  assert.equal(coordinator.failedDeliveryState("send-retry").deliveryFailures, 1);
+  assert.equal(coordinator.failedDeliveryState("send-retry"), null);
 
   clock.advance(99);
   assert.equal(attempts.length, 1);
   clock.advance(1);
   assert.equal(attempts.length, 2);
   assert.equal(coordinator.pendingState("send-retry"), null);
+  assert.equal(await dispatch.completion, true);
   assert.deepEqual(
     coordinator.observeOutgoing(channel, channel, [
       { type: "fetch-response", requestId: "send-retry", responseType: "success" },
     ]),
     { suppress: true, requestId: "send-retry" }
   );
+});
+
+test("Statsig IPC terminal delivery failure rejects the caller and only a real success clears its tombstone", async () => {
+  const clock = createFakeStatsigClock();
+  const attempts = [];
+  const failures = [];
+  const coordinator = createStatsigIpcFallbackCoordinator({
+    policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: true },
+    sendFallback: (response, details) => {
+      attempts.push({ response, details });
+      return false;
+    },
+    onDeliveryFailure: (failure) => failures.push(failure),
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const channel = "message-from-view";
+  const dispatch = coordinator.beforeInvoke(channel, channel, [
+    {
+      type: "fetch",
+      requestId: "terminal-send",
+      url: "https://ab.chatgpt.com/v1/initialize",
+    },
+  ]);
+  assert.equal(dispatch.handled, true);
+
+  clock.advance(300);
+  assert.equal(attempts.length, 3);
+  assert.equal(coordinator.pendingCount(), 0);
+  assert.equal(failures.length, 1);
+  await assert.rejects(
+    dispatch.completion,
+    (error) => error?.code === "STATSIG_FALLBACK_DELIVERY_FAILED"
+  );
+  const terminal = coordinator.terminalFailureState("terminal-send");
+  assert.equal(terminal.terminal, true);
+  assert.equal(terminal.deliveryAttempts, 3);
+
+  assert.deepEqual(
+    coordinator.observeOutgoing(channel, channel, [
+      { type: "fetch-response", requestId: "terminal-send", responseType: "error" },
+    ]),
+    { suppress: true, requestId: "terminal-send" }
+  );
+  assert.deepEqual(
+    coordinator.observeOutgoing(channel, channel, [
+      {
+        type: "fetch-response",
+        requestId: "terminal-send",
+        responseType: "success",
+        status: 200,
+        bodyJsonString: "{}",
+      },
+    ]),
+    { suppress: true, requestId: "terminal-send" }
+  );
+  assert.equal(coordinator.terminalFailureState("terminal-send").terminal, true);
+
+  assert.deepEqual(
+    coordinator.observeOutgoing(channel, channel, [
+      {
+        type: "fetch-response",
+        requestId: "terminal-send",
+        responseType: "success",
+        status: 200,
+        bodyJsonString: '{"has_updates":false}',
+      },
+    ]),
+    { suppress: false, requestId: "terminal-send" }
+  );
+  assert.equal(coordinator.terminalFailureState("terminal-send"), null);
 });
 
 test("Statsig IPC exact matches swallow telemetry and pass all other fetch routes", () => {
