@@ -612,11 +612,8 @@ function createStatsigIpcFallbackCoordinator({
       response.responseType === "success" &&
       isConsumableStatsigInitializeFetchResponse(response);
     if (terminalFailures.has(requestId)) {
-      if (!validSuccess) return { suppress: true, requestId };
-      // terminal tombstone 只阻止迟到错误；真实合法 success 仍可作为唯一最终结果放行。
-      terminalFailures.delete(requestId);
-      rememberSuccessCompleted(requestId);
-      return { suppress: false, requestId };
+      // terminal failure 已经是最终结果；之后任何 late success/error/malformed 都不能再成为第二终态。
+      return { suppress: true, requestId };
     }
     const entry = pending.get(requestId);
     if (!entry) return { suppress: false };

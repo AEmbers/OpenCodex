@@ -2223,6 +2223,39 @@ async function waitForOfficialBridgeReady(timeoutMs = 20_000) {
   throw new Error("Official IPC bridge was not ready before timeout");
 }
 
+/**
+ * Statsig initialize 的 handler/listener 与 fallback completion 竞速。
+ * completion 先到即可结束原 IPC；晚到 handler 结果仍保留 then/catch 消费，不能形成 unhandled rejection。
+ */
+async function invokeStatsigAwareOperation(operation, statsigDispatch, onOperationFailure) {
+  const completion = statsigDispatch?.completion;
+  if (!completion) return operation;
+  const operationOutcome = Promise.resolve(operation).then(
+    (result) => ({ kind: "operation", ok: true, result }),
+    (error) => ({ kind: "operation", ok: false, error })
+  );
+  const completionOutcome = completion.then(
+    (result) => ({ kind: "completion", ok: true, result }),
+    (error) => ({ kind: "completion", ok: false, error })
+  );
+  const first = await Promise.race([operationOutcome, completionOutcome]);
+  if (first.kind === "completion") {
+    if (!first.ok) throw first.error;
+    return true;
+  }
+  if (first.ok) {
+    // handler 已正常返回，但普通 IPC 语义要求先完成 Statsig terminal 判定再向调用方返回。
+    await completion;
+    return first.result;
+  }
+  const failure = typeof onOperationFailure === "function"
+    ? await onOperationFailure(first.error)
+    : { handled: false };
+  if (!failure?.handled) throw first.error;
+  await completion;
+  return true;
+}
+
 async function invokeOfficialIpc(channel, args = [], context = {}) {
   await waitForOfficialBridgeReady();
   const event = createOfficialIpcEvent(context);
@@ -2244,34 +2277,26 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
   logDesktopFeatureAvailability(channel, invokeArgs);
   const handler = officialIpc.handlers.get(channel);
   if (handler) {
-    try {
-      const result = await handler(event, ...invokeArgs);
-      if (statsigDispatch.completion) await statsigDispatch.completion;
-      return result;
-    } catch (error) {
-      // handler 失败后只保留一个终态：已登记 Statsig initialize 时转为延迟合成响应并吞掉 IPC 异常。
-      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) {
-        if (statsigDispatch.completion) await statsigDispatch.completion;
-        return true;
-      }
-      throw error;
-    }
+    const operation = Promise.resolve().then(() => handler(event, ...invokeArgs));
+    return invokeStatsigAwareOperation(
+      operation,
+      statsigDispatch,
+      (error) => statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error)
+    );
   }
   const listeners = officialIpc.listeners.get(channel);
   if (listeners && listeners.size > 0) {
-    try {
+    const operation = (async () => {
       for (const listener of [...listeners]) {
         await listener(event, ...invokeArgs);
       }
-      if (statsigDispatch.completion) await statsigDispatch.completion;
-    } catch (error) {
-      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) {
-        if (statsigDispatch.completion) await statsigDispatch.completion;
-        return true;
-      }
-      throw error;
-    }
-    return event.returnValue === undefined ? true : event.returnValue;
+      return event.returnValue === undefined ? true : event.returnValue;
+    })();
+    return invokeStatsigAwareOperation(
+      operation,
+      statsigDispatch,
+      (error) => statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error)
+    );
   }
   logUnknownIpc("missing-ipc-handler", {
     channel,
@@ -2895,6 +2920,7 @@ module.exports = {
     threadListInvalidationRequest,
     classifyStatsigRequestUrl,
     buildStatsigInitializeGatewayResponse: buildStatsigInitializeResponse,
+    invokeStatsigAwareOperation,
     statsigIpcFallbackCoordinator,
   },
 };

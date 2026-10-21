@@ -59,6 +59,16 @@ function createFakeStatsigClock() {
   };
 }
 
+function createDeferred() {
+  let reject;
+  let resolve;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+  return { promise, reject, resolve };
+}
+
 function createStatsigNetHarness(t, options = {}) {
   const calls = [];
   const intercepted = [];
@@ -545,6 +555,34 @@ test("Statsig IPC handler rejection finalizes to one fallback response", async (
   assert.equal(sent.length, 1, "handler rejection must not emit IPC error plus a later success");
 });
 
+test("Statsig handler race exits on fallback success and consumes a late handler rejection", async () => {
+  const handler = createDeferred();
+  const completion = createDeferred();
+  const pending = __test.invokeStatsigAwareOperation(handler.promise, {
+    completion: completion.promise,
+  });
+
+  completion.resolve(true);
+  assert.equal(await pending, true);
+  handler.reject(new Error("late handler rejection after fallback"));
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("Statsig listener race exits on terminal fallback failure and consumes a late listener resolve", async () => {
+  const listener = createDeferred();
+  const completion = createDeferred();
+  const terminal = new Error("terminal fallback failure");
+  terminal.code = "STATSIG_FALLBACK_DELIVERY_FAILED";
+  const pending = __test.invokeStatsigAwareOperation(listener.promise, {
+    completion: completion.promise,
+  });
+
+  completion.reject(terminal);
+  await assert.rejects(pending, (error) => error === terminal);
+  listener.resolve(true);
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
 test("Statsig IPC keeps failed fallback deliveries recoverable until a real send succeeds", async () => {
   const clock = createFakeStatsigClock();
   const attempts = [];
@@ -594,7 +632,7 @@ test("Statsig IPC keeps failed fallback deliveries recoverable until a real send
   );
 });
 
-test("Statsig IPC terminal delivery failure rejects the caller and only a real success clears its tombstone", async () => {
+test("Statsig IPC terminal delivery failure rejects the caller and suppresses every late response", async () => {
   const clock = createFakeStatsigClock();
   const attempts = [];
   const failures = [];
@@ -618,13 +656,14 @@ test("Statsig IPC terminal delivery failure rejects the caller and only a real s
     },
   ]);
   assert.equal(dispatch.handled, true);
+  const pendingInvoke = __test.invokeStatsigAwareOperation(new Promise(() => {}), dispatch);
 
   clock.advance(300);
   assert.equal(attempts.length, 3);
   assert.equal(coordinator.pendingCount(), 0);
   assert.equal(failures.length, 1);
   await assert.rejects(
-    dispatch.completion,
+    pendingInvoke,
     (error) => error?.code === "STATSIG_FALLBACK_DELIVERY_FAILED"
   );
   const terminal = coordinator.terminalFailureState("terminal-send");
@@ -661,9 +700,9 @@ test("Statsig IPC terminal delivery failure rejects the caller and only a real s
         bodyJsonString: '{"has_updates":false}',
       },
     ]),
-    { suppress: false, requestId: "terminal-send" }
+    { suppress: true, requestId: "terminal-send" }
   );
-  assert.equal(coordinator.terminalFailureState("terminal-send"), null);
+  assert.equal(coordinator.terminalFailureState("terminal-send").terminal, true);
 });
 
 test("Statsig IPC exact matches swallow telemetry and pass all other fetch routes", () => {
