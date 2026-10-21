@@ -127,6 +127,58 @@ function createBrowserFocusHarness(bridge) {
   };
 }
 
+function createOpenExternalHarness(bridge, currentUrl) {
+  const current = new URL(currentUrl);
+  const actions = { assigned: [], opened: [], reloads: 0, effects: 0 };
+  const location = {
+    assign(url) {
+      actions.assigned.push(String(url));
+    },
+    hash: current.hash,
+    hostname: current.hostname,
+    href: current.href,
+    origin: current.origin,
+    pathname: current.pathname,
+    port: current.port,
+    protocol: current.protocol,
+    reload() {
+      actions.reloads += 1;
+    },
+    search: current.search,
+  };
+  const w = {
+    location,
+    open(...args) {
+      actions.opened.push(args);
+      return {};
+    },
+  };
+  const names = [
+    "isKnownGatewayPagePath",
+    "effectiveUrlPort",
+    "isLoopbackGatewayHost",
+    "gatewayNavigationAction",
+    "openExternal",
+  ];
+  const context = {
+    URL,
+    modificationEffects: {
+      externalOpen: {
+        emit() {
+          actions.effects += 1;
+        },
+      },
+    },
+    w,
+  };
+  const api = vm.runInNewContext(
+    `${names.map((name) => sourceFunctionDeclaration(bridge, name)).join("\n")}
+     ({ ${names.join(", ")} })`,
+    context
+  );
+  return { actions, api, current, w };
+}
+
 function createAppHostWireHarness(bridge) {
   const codec = require(APP_HOST_MESSAGE_CODEC);
   const functionNames = ["appHostMessageCodec", "encodeAppHostMessageData", "decodeAppHostMessageData"];
@@ -1000,6 +1052,65 @@ test("bridge resolves window focus from the browser instead of the hidden Electr
   );
   assert.match(bridge, /dispatch\(effectiveChannel, rendererMessagePayload\)/);
   assert.match(bridge, /emitWindowMessage\(effectiveChannel, rendererMessagePayload\)/);
+});
+
+test("bridge reloads current URLs and assigns only known gateway pages", () => {
+  const bridge = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
+  const currentUrl =
+    "http://192.168.1.20:3737/settings/developer/runtime-compatibility?tab=status#top";
+  const harness = createOpenExternalHarness(bridge, currentUrl);
+
+  assert.equal(harness.api.openExternal(currentUrl), true);
+  assert.equal(harness.actions.reloads, 1);
+  assert.deepEqual(harness.actions.assigned, []);
+  assert.deepEqual(harness.actions.opened, []);
+
+  assert.equal(harness.api.openExternal("http://192.168.1.20:3737/"), true);
+  assert.equal(harness.api.openExternal("http://192.168.1.20:3737/opencodex/runtime-compatibility"), true);
+  assert.deepEqual(harness.actions.assigned, [
+    "http://192.168.1.20:3737/",
+    "http://192.168.1.20:3737/opencodex/runtime-compatibility",
+  ]);
+
+  // loopback 仅在同协议、同有效端口、已知网关路径时映射到当前 origin。
+  assert.equal(harness.api.openExternal("http://127.0.0.1:3737/"), true);
+  assert.equal(
+    harness.api.openExternal("http://localhost:3737/settings/developer/runtime-compatibility"),
+    true
+  );
+  assert.deepEqual(harness.actions.assigned.slice(-2), [
+    "http://192.168.1.20:3737/",
+    "http://192.168.1.20:3737/settings/developer/runtime-compatibility",
+  ]);
+
+  for (const externalUrl of [
+    "https://chatgpt.com/",
+    "http://localhost:9999/",
+    "http://localhost:3737/unknown-gateway-page",
+    "http://192.168.1.20:3737/unknown-gateway-page",
+    "https://localhost:3737/",
+  ]) {
+    assert.equal(harness.api.openExternal(externalUrl), true);
+  }
+  assert.deepEqual(
+    harness.actions.opened.map((args) => args[0]),
+    [
+      "https://chatgpt.com/",
+      "http://localhost:9999/",
+      "http://localhost:3737/unknown-gateway-page",
+      "http://192.168.1.20:3737/unknown-gateway-page",
+      "https://localhost:3737/",
+    ]
+  );
+  assert.equal(harness.actions.effects, 10);
+
+  // shell.openExternal、preload target 和 open-in-browser 必须共用同一个分类入口。
+  assert.match(bridge, /shell: \{ openExternal \}/);
+  assert.match(bridge, /target\.openExternal = \(url\) => openExternal\(url\)/);
+  assert.match(
+    bridge,
+    /payload\.type === "open-in-browser"[\s\S]{0,120}return openExternal\(payload\.url\)/
+  );
 });
 
 test("bridge suppresses only mobile-subscription billing 400 fallback toasts", () => {

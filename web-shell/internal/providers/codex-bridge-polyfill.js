@@ -2877,10 +2877,75 @@
     return enqueueTerminalInvoke(sessionId, payload);
   }
 
+  /** 只有这些网关页面允许在当前标签内导航；其他同源地址仍按外部页面处理。 */
+  function isKnownGatewayPagePath(pathname) {
+    const normalized = String(pathname || "/").replace(/\/+$/, "") || "/";
+    return new Set([
+      "/",
+      "/opencodex/runtime-compatibility",
+      "/settings/developer/runtime-compatibility",
+    ]).has(normalized);
+  }
+
+  function effectiveUrlPort(url) {
+    if (url.port) return url.port;
+    if (url.protocol === "https:") return "443";
+    if (url.protocol === "http:") return "80";
+    return "";
+  }
+
+  function isLoopbackGatewayHost(hostname) {
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+  }
+
+  /**
+   * 判断 openExternal 是否应该复用当前页面：
+   * 当前 URL 直接 reload；已知网关页 navigation 用 assign；
+   * loopback 只在 scheme、有效端口和路径全部匹配时映射到当前 origin。
+   */
+  function gatewayNavigationAction(rawUrl) {
+    let target;
+    let current;
+    try {
+      current = new URL(w.location.href);
+      target = new URL(String(rawUrl || ""), current.href);
+    } catch {
+      return null;
+    }
+    if (target.protocol !== "http:" && target.protocol !== "https:") return null;
+    if (target.origin === current.origin) {
+      if (target.href === current.href) return { action: "reload", url: current.href };
+      if (isKnownGatewayPagePath(target.pathname)) return { action: "assign", url: target.href };
+      return null;
+    }
+    const mappedLoopbackGateway =
+      !target.username &&
+      !target.password &&
+      isLoopbackGatewayHost(target.hostname) &&
+      target.protocol === current.protocol &&
+      effectiveUrlPort(target) === effectiveUrlPort(current) &&
+      isKnownGatewayPagePath(target.pathname);
+    if (!mappedLoopbackGateway) return null;
+    const mappedUrl = new URL(`${target.pathname}${target.search}${target.hash}`, current.origin).href;
+    return {
+      action: mappedUrl === current.href ? "reload" : "assign",
+      url: mappedUrl,
+    };
+  }
+
   /** Electron shell.openExternal 的浏览器实现。 */
   function openExternal(url) {
     modificationEffects?.externalOpen?.emit();
-    const newWindow = w.open(url, "_blank", "noopener,noreferrer");
+    const navigation = gatewayNavigationAction(url);
+    if (navigation?.action === "reload") {
+      w.location.reload();
+      return true;
+    }
+    if (navigation?.action === "assign") {
+      w.location.assign(navigation.url);
+      return true;
+    }
+    const newWindow = w.open(String(url || ""), "_blank", "noopener,noreferrer");
     if (newWindow) return true;
     return true;
   }
