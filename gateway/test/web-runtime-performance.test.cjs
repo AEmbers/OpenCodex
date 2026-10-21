@@ -66,12 +66,48 @@ function sourceSection(source, startMarker, endMarker) {
 }
 
 function createComposerDraftHarness() {
-  return vm.runInNewContext(
+  const emitted = [];
+  const toasts = [];
+  const context = {
+    OPENCODEX_LOCALE: "en-US",
+    emitPersistedAtomUpdated: (...args) => emitted.push(args),
+    rollbackEvents: emitted,
+    showBridgeToast: (payload) => toasts.push(payload),
+    toastEvents: toasts,
+  };
+  const api = vm.runInNewContext(
     `(() => {
       const persistedAtomSnapshot = new Map();
       const PERSISTED_ATOM_SNAPSHOT_MAX_ENTRIES = 512;
       const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set();
       const writes = [];
+      let currentTime = 0;
+      let nextTimerId = 1;
+      const timers = new Map();
+      function setTimer(callback, delay) {
+        const id = nextTimerId++;
+        timers.set(id, { callback, dueAt: currentTime + Math.max(0, Number(delay) || 0) });
+        return id;
+      }
+      function clearTimer(id) {
+        timers.delete(id);
+      }
+      function advanceTimers(ms) {
+        const target = currentTime + Math.max(0, Number(ms) || 0);
+        while (true) {
+          let next = null;
+          for (const [id, timer] of timers) {
+            if (timer.dueAt <= target && (!next || timer.dueAt < next.timer.dueAt)) {
+              next = { id, timer };
+            }
+          }
+          if (!next) break;
+          timers.delete(next.id);
+          currentTime = next.timer.dueAt;
+          next.timer.callback();
+        }
+        currentTime = target;
+      }
       function normalizePersistedAtomValue(_key, value) { return value; }
       function trimSnapshotMap() {}
       function invoke(_channel, payload) {
@@ -97,21 +133,39 @@ function createComposerDraftHarness() {
         "\n\n  initializePersistedAtomSnapshot();"
       )}
       return {
+        advance: advanceTimers,
         dispose() {
           composerDraftBridgeDisposed = true;
+          for (const write of pendingComposerDraftWrites) clearComposerDraftWriteTimers(write);
           pendingComposerDraftWrites.length = 0;
         },
+        clearTimer,
+        emitted: () => rollbackEvents.slice(),
+        entryCount: pendingComposerDraftEntryCount,
+        toasts: () => toastEvents.slice(),
+        pendingKeys: () => pendingComposerDraftWrites.flatMap(
+          (write) => Object.keys(write.recordUpdate.entries)
+        ),
         pending: () => pendingComposerDraftWrites.map((write) => ({
           payload: write.payload,
-          sent: write.sent,
+          attempts: write.attempts,
+          inFlight: write.inFlight,
         })),
         reconcile: reconcileComposerDraftUpdate,
+        reconcileState: reconcileComposerDraftState,
         snapshot: () => Object.fromEntries(persistedAtomSnapshot.entries()),
+        setTimer,
         update: forwardComposerDraftUpdate,
         writes,
       };
-    })()`
+    })()`,
+    context
   );
+  context.scheduler = {
+    clearTimeout: api.clearTimer,
+    setTimeout: api.setTimer,
+  };
+  return api;
 }
 
 function composerDraftUpdate(threadId, value) {
@@ -1858,7 +1912,7 @@ test("composer draft queue converges consecutive input on the final value", asyn
   await nextTurn();
 
   assert.equal(drafts.writes.length, 1, "unsent rapid updates should coalesce");
-  assert.deepEqual(drafts.writes[0].payload.recordUpdate.entries["thread-one"], { value: "ab" });
+  assert.equal(drafts.writes[0].payload.recordUpdate.entries["thread-one"].value, "ab");
   assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "ab");
 
   drafts.writes[0].resolve(true);
@@ -1868,7 +1922,7 @@ test("composer draft queue converges consecutive input on the final value", asyn
     key: "composer-prompt-drafts-v2",
     value: { "thread-one": "ab" },
   });
-  assert.deepEqual(reconciled.value, { "thread-one": "ab" });
+  assert.equal(reconciled.value["thread-one"], "ab");
   assert.equal(drafts.pending().length, 0);
 });
 
@@ -1916,26 +1970,123 @@ test("composer draft page replacement prevents queued writes from reaching the n
   assert.equal(drafts.pending().length, 0);
   assert.match(
     BRIDGE_SOURCE,
-    /composerDraftBridgeDisposed = true;\s*pendingComposerDraftWrites\.length = 0;/
+    /composerDraftBridgeDisposed = true;[\s\S]{0,180}pendingComposerDraftWrites\.length = 0;/
   );
 });
 
-test("composer draft queue resumes after a failed write", async () => {
+test("composer draft failures retain optimistic protection against old sync", async () => {
   const drafts = createComposerDraftHarness();
   const failed = drafts.update(composerDraftUpdate("thread-one", "first"));
   await nextTurn();
   drafts.writes[0].reject(new Error("fixture draft write failed"));
   await assert.rejects(failed, /fixture draft write failed/);
   await nextTurn();
-  assert.equal(drafts.pending().length, 0);
+  assert.equal(drafts.entryCount(), 1);
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "first");
 
-  const recovered = drafts.update(composerDraftUpdate("thread-one", "recovered"));
+  const stale = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: {},
+  });
+  assert.equal(stale.value["thread-one"], "first");
+  await nextTurn();
+  assert.equal(drafts.writes.length, 2, "the next host snapshot should trigger a retry");
+  drafts.writes[1].resolve(true);
+  await nextTurn();
+  drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: { "thread-one": "first" },
+  });
+  assert.equal(drafts.entryCount(), 0);
+});
+
+test("composer draft retry recovers after a transient invoke failure", async () => {
+  const drafts = createComposerDraftHarness();
+  const first = drafts.update(composerDraftUpdate("thread-one", "recover me"));
+  await nextTurn();
+  drafts.writes[0].reject(new Error("transient"));
+  await assert.rejects(first, /transient/);
+  assert.equal(drafts.entryCount(), 1);
+
+  // 新写入立即触发退避中的旧 intent 重试。
+  const second = drafts.update(composerDraftUpdate("thread-two", "new intent"));
   await nextTurn();
   assert.equal(drafts.writes.length, 2);
-  assert.deepEqual(drafts.writes[1].payload.recordUpdate.entries["thread-one"], { value: "recovered" });
   drafts.writes[1].resolve(true);
-  await recovered;
-  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "recovered");
+  await second;
+  await nextTurn();
+  assert.equal(drafts.writes.length, 3);
+  drafts.writes[2].resolve(true);
+  await nextTurn();
+
+  const confirmed = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: { "thread-one": "recover me", "thread-two": "new intent" },
+  });
+  assert.equal(confirmed.value["thread-one"], "recover me");
+  assert.equal(confirmed.value["thread-two"], "new intent");
+  assert.equal(drafts.entryCount(), 0);
+});
+
+test("composer draft gives up with an explicit rollback and toast", async () => {
+  const drafts = createComposerDraftHarness();
+  const first = drafts.update(composerDraftUpdate("thread-one", "never saved"));
+  await nextTurn();
+  drafts.writes[0].reject(new Error("failure 1"));
+  await assert.rejects(first, /failure 1/);
+
+  for (const [index, delay] of [[1, 250], [2, 500], [3, 1000]]) {
+    drafts.advance(delay);
+    await nextTurn();
+    drafts.writes[index].reject(new Error(`failure ${index + 1}`));
+    await nextTurn();
+  }
+
+  assert.equal(drafts.entryCount(), 0);
+  assert.equal(Object.keys(drafts.snapshot()["composer-prompt-drafts-v2"]).length, 0);
+  assert.equal(drafts.emitted().at(-1)[0], "composer-prompt-drafts-v2");
+  assert.equal(drafts.toasts().length, 1);
+});
+
+test("composer draft full sync acknowledges persisted intents before applying overrides", async () => {
+  const drafts = createComposerDraftHarness();
+  const saved = drafts.update(composerDraftUpdate("thread-one", "persisted"));
+  const pending = drafts.update(composerDraftUpdate("thread-two", "still pending"));
+  await nextTurn();
+  drafts.writes[0].resolve(true);
+  await saved;
+  await nextTurn();
+  drafts.writes[1].resolve(true);
+  await pending;
+
+  const synced = drafts.reconcileState({
+    "thread-one": "persisted",
+    "thread-two": "old host value",
+  });
+  assert.equal(synced.value["thread-one"], "persisted");
+  assert.equal(synced.value["thread-two"], "still pending");
+  assert.equal(drafts.pendingKeys().join(","), "thread-two");
+  assert.match(
+    BRIDGE_SOURCE,
+    /channel === "persisted-atom-sync"[\s\S]{0,800}reconcileComposerDraftState/
+  );
+});
+
+test("composer draft pending overrides stay bounded while retaining the newest intent", () => {
+  const drafts = createComposerDraftHarness();
+  for (let index = 0; index < 80; index += 1) {
+    drafts.update(composerDraftUpdate(`thread-${index}`, `draft-${index}`));
+  }
+
+  assert.equal(drafts.entryCount(), 64);
+  assert.ok(drafts.entryCount() <= 64);
+  assert.ok(drafts.pending().length <= 64);
+  assert.equal(drafts.pendingKeys().includes("thread-0"), false);
+  assert.equal(drafts.pendingKeys().includes("thread-79"), true);
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-79"], "draft-79");
 });
 
 test("official shared-object updates remain authoritative for guardian approval", () => {

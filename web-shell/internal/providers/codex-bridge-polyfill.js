@@ -1478,13 +1478,24 @@
 
   /** hidden Electron 代理窗口的 focus 状态不代表浏览器，入站时统一替换为页面真实状态。 */
   function browserRendererMessagePayload(channel, payload) {
-    if (channel === "persisted-atom-sync" && pendingComposerDraftWrites.length > 0) {
-      let value = payload?.state?.[COMPOSER_PROMPT_DRAFTS_KEY];
-      for (const write of pendingComposerDraftWrites) {
-        // 重连的全量快照同样保留尚未确认的草稿增量，不能重新填入已发送内容。
-        value = mergeComposerDraftRecord(value, write.recordUpdate);
+    if (channel === "persisted-atom-sync") {
+      // 全量快照也走与增量回包相同的累计确认，已落盘条目必须先移出 pending。
+      const hasHostDrafts =
+        payload?.state &&
+        Object.prototype.hasOwnProperty.call(payload.state, COMPOSER_PROMPT_DRAFTS_KEY);
+      if (hasHostDrafts || pendingComposerDraftWrites.length > 0) {
+        const reconciled = reconcileComposerDraftState(
+          hasHostDrafts ? payload.state[COMPOSER_PROMPT_DRAFTS_KEY] : {},
+          { deleted: false }
+        );
+        const state = { ...payload.state };
+        if (hasHostDrafts || pendingComposerDraftWrites.length > 0) {
+          state[COMPOSER_PROMPT_DRAFTS_KEY] = reconciled.value;
+        } else {
+          delete state[COMPOSER_PROMPT_DRAFTS_KEY];
+        }
+        return { ...payload, state };
       }
-      return { ...payload, state: { ...payload?.state, [COMPOSER_PROMPT_DRAFTS_KEY]: value } };
     }
     if (channel === "persisted-atom-updated" && payload?.key === COMPOSER_PROMPT_DRAFTS_KEY) {
       // 先确认已落盘的草稿写入，再用尚未确认的新输入或清空操作覆盖迟到快照。
@@ -3125,7 +3136,13 @@
   const sharedObjectSnapshot = new Map();
   const persistedAtomSnapshot = new Map();
   const COMPOSER_PROMPT_DRAFTS_KEY = "composer-prompt-drafts-v2";
+  const COMPOSER_DRAFT_PENDING_MAX_ENTRIES = 64;
+  const COMPOSER_DRAFT_WRITE_MAX_ATTEMPTS = 4;
+  const COMPOSER_DRAFT_RETRY_BASE_MS = 250;
+  const COMPOSER_DRAFT_RETRY_MAX_MS = 4000;
+  const COMPOSER_DRAFT_ACK_TIMEOUT_MS = 5000;
   const pendingComposerDraftWrites = [];
+  let composerDraftHostRecord = {};
   let composerDraftWriteTail = Promise.resolve();
   let composerDraftBridgeDisposed = false;
   const PENDING_WORKTREES_KEY = "pending_worktrees";
@@ -3311,71 +3328,253 @@
     return Object.fromEntries(merged);
   }
 
-  /** 仅串行化文本草稿；发送消息仍使用原通道，失败不会阻止后续清空或恢复写入。 */
-  function forwardComposerDraftUpdate(payload) {
-    if (composerDraftBridgeDisposed) return Promise.resolve(false);
-    const previous = persistedAtomSnapshot.get(payload.key) ??
-      persistedAtomSnapshot.get(payload.recordUpdate.legacyStorageKey);
-    // 页内快照跟随官方增量，不把 recordUpdate 缺省的 value 回显为 null。
-    const value = mergeComposerDraftRecord(previous, payload.recordUpdate);
-    setPersistedAtomSnapshotValue(payload.key, value, false);
-    const queued = pendingComposerDraftWrites.at(-1);
-    if (queued && !queued.sent) {
-      // 公网慢于打字频率时合并未发送增量；同一会话保留最后操作，其他会话增量不丢失。
-      queued.recordUpdate = {
-        ...queued.recordUpdate,
-        ...payload.recordUpdate,
-        entries: { ...queued.recordUpdate.entries, ...payload.recordUpdate.entries },
-      };
-      queued.payload = { ...payload, recordUpdate: queued.recordUpdate };
-      return queued.result;
+  function clearComposerDraftWriteTimers(write) {
+    if (write.retryTimer != null) scheduler.clearTimeout(write.retryTimer);
+    if (write.ackTimer != null) scheduler.clearTimeout(write.ackTimer);
+    write.retryTimer = null;
+    write.ackTimer = null;
+  }
+
+  function pruneEmptyComposerDraftWrites() {
+    for (let index = pendingComposerDraftWrites.length - 1; index >= 0; index -= 1) {
+      const write = pendingComposerDraftWrites[index];
+      if (Object.keys(write.recordUpdate.entries).length > 0) continue;
+      clearComposerDraftWriteTimers(write);
+      pendingComposerDraftWrites.splice(index, 1);
     }
-    const write = { payload, recordUpdate: payload.recordUpdate, sent: false, result: null };
-    pendingComposerDraftWrites.push(write);
-    const result = composerDraftWriteTail.then(async () => {
-      if (composerDraftBridgeDisposed) return false;
-      write.sent = true;
-      try {
-        // 等前一次 HTTP 分发完成后再发送，保证旧保存先于提交后的删除到达宿主。
-        return await invoke("codex_desktop:message-from-view", write.payload);
-      } catch (error) {
-        const index = pendingComposerDraftWrites.indexOf(write);
-        if (index >= 0) pendingComposerDraftWrites.splice(index, 1);
+  }
+
+  function pendingComposerDraftEntryCount() {
+    return pendingComposerDraftWrites.reduce(
+      (total, write) => total + Object.keys(write.recordUpdate.entries).length,
+      0
+    );
+  }
+
+  function removeComposerDraftIntent(key) {
+    for (const write of pendingComposerDraftWrites) delete write.recordUpdate.entries[key];
+    pruneEmptyComposerDraftWrites();
+  }
+
+  /** 每个 thread key 只保留最新意图；超过硬上限时从最旧键开始淘汰。 */
+  function boundComposerDraftEntries(entries) {
+    const incoming = Object.entries(entries);
+    for (const [key] of incoming) removeComposerDraftIntent(key);
+    const retained = incoming.slice(-COMPOSER_DRAFT_PENDING_MAX_ENTRIES);
+    while (pendingComposerDraftEntryCount() + retained.length > COMPOSER_DRAFT_PENDING_MAX_ENTRIES) {
+      let removed = false;
+      for (const write of pendingComposerDraftWrites) {
+        const oldestKey = Object.keys(write.recordUpdate.entries)[0];
+        if (!oldestKey) continue;
+        delete write.recordUpdate.entries[oldestKey];
+        removed = true;
+        break;
+      }
+      pruneEmptyComposerDraftWrites();
+      if (!removed) break;
+    }
+    return Object.fromEntries(retained);
+  }
+
+  function composerDraftValueWithPending(hostRecord) {
+    let value = { ...(isPlainObject(hostRecord) ? hostRecord : {}) };
+    for (const write of pendingComposerDraftWrites) {
+      // pending 只覆盖尚未由宿主确认的 thread，其他会话继续使用宿主快照。
+      value = mergeComposerDraftRecord(value, write.recordUpdate);
+    }
+    return value;
+  }
+
+  function composerDraftEntryMatches(record, key, entry) {
+    if (entry == null) return !Object.prototype.hasOwnProperty.call(record, key);
+    if (entry.updateOnly && !Object.prototype.hasOwnProperty.call(record, key)) return false;
+    return JSON.stringify(record[key]) === JSON.stringify(entry.value);
+  }
+
+  /** 增量回包和 full sync 共用累计确认；只有宿主真正匹配的 intent 才离开 pending。 */
+  function reconcileComposerDraftState(value, { deleted = false } = {}) {
+    const hostRecord = deleted || !isPlainObject(value) ? {} : value;
+    composerDraftHostRecord = { ...hostRecord };
+    for (const write of pendingComposerDraftWrites) {
+      for (const [key, entry] of Object.entries(write.recordUpdate.entries)) {
+        if (composerDraftEntryMatches(hostRecord, key, entry)) {
+          delete write.recordUpdate.entries[key];
+        }
+      }
+    }
+    pruneEmptyComposerDraftWrites();
+    const reconciledValue = composerDraftValueWithPending(hostRecord);
+    setPersistedAtomSnapshotValue(
+      COMPOSER_PROMPT_DRAFTS_KEY,
+      reconciledValue,
+      deleted && pendingComposerDraftWrites.length === 0
+    );
+    retryDeferredComposerDraftWrites();
+    return { value: reconciledValue };
+  }
+
+  function composerDraftRollbackMessage() {
+    return /^zh/i.test(OPENCODEX_LOCALE)
+      ? "草稿保存失败，已恢复为宿主最近确认的内容。"
+      : "Draft save failed. The last host-confirmed content was restored.";
+  }
+
+  function abandonComposerDraftWrite(write) {
+    const index = pendingComposerDraftWrites.indexOf(write);
+    if (index < 0) return;
+    clearComposerDraftWriteTimers(write);
+    pendingComposerDraftWrites.splice(index, 1);
+    const value = composerDraftValueWithPending(composerDraftHostRecord);
+    setPersistedAtomSnapshotValue(COMPOSER_PROMPT_DRAFTS_KEY, value, false);
+    // 放弃重试时必须显式把 renderer 拉回宿主已确认状态，并让用户知道草稿未保存。
+    emitPersistedAtomUpdated(COMPOSER_PROMPT_DRAFTS_KEY, value, false);
+    try {
+      showBridgeToast({
+        level: "danger",
+        source: "codex-web-drafts",
+        description: composerDraftRollbackMessage(),
+      });
+    } catch {}
+  }
+
+  function scheduleComposerDraftRetry(write) {
+    if (composerDraftBridgeDisposed || !pendingComposerDraftWrites.includes(write)) return;
+    if (Object.keys(write.recordUpdate.entries).length === 0) {
+      pruneEmptyComposerDraftWrites();
+      return;
+    }
+    if (write.attempts >= COMPOSER_DRAFT_WRITE_MAX_ATTEMPTS) {
+      abandonComposerDraftWrite(write);
+      return;
+    }
+    const delay = Math.min(
+      COMPOSER_DRAFT_RETRY_MAX_MS,
+      COMPOSER_DRAFT_RETRY_BASE_MS * 2 ** Math.max(0, write.attempts - 1)
+    );
+    write.retryTimer = scheduler.setTimeout(() => {
+      write.retryTimer = null;
+      void queueComposerDraftWrite(write).catch(() => {});
+    }, delay);
+  }
+
+  function handleComposerDraftWriteFailure(write) {
+    write.inFlight = false;
+    clearComposerDraftWriteTimers(write);
+    scheduleComposerDraftRetry(write);
+  }
+
+  function queueComposerDraftWrite(write) {
+    if (
+      composerDraftBridgeDisposed ||
+      write.inFlight ||
+      !pendingComposerDraftWrites.includes(write) ||
+      Object.keys(write.recordUpdate.entries).length === 0
+    ) {
+      return Promise.resolve(false);
+    }
+    if (write.retryTimer != null) {
+      scheduler.clearTimeout(write.retryTimer);
+      write.retryTimer = null;
+    }
+    write.inFlight = true;
+    write.attempts += 1;
+    const sendPayload = {
+      ...write.payload,
+      recordUpdate: {
+        ...write.recordUpdate,
+        entries: { ...write.recordUpdate.entries },
+      },
+    };
+    const invocation = composerDraftWriteTail.then(() => {
+      if (
+        composerDraftBridgeDisposed ||
+        !pendingComposerDraftWrites.includes(write) ||
+        Object.keys(write.recordUpdate.entries).length === 0
+      ) {
+        return false;
+      }
+      return invoke("codex_desktop:message-from-view", sendPayload);
+    });
+    const result = invocation.then(
+      (value) => {
+        write.inFlight = false;
+        if (!pendingComposerDraftWrites.includes(write)) return value;
+        // 传输成功仍需等待匹配快照；echo 丢失时按有界退避再次尝试同一条 intent。
+        write.ackTimer = scheduler.setTimeout(() => {
+          write.ackTimer = null;
+          handleComposerDraftWriteFailure(write);
+        }, COMPOSER_DRAFT_ACK_TIMEOUT_MS);
+        return value;
+      },
+      (error) => {
+        if (
+          !pendingComposerDraftWrites.includes(write) ||
+          Object.keys(write.recordUpdate.entries).length === 0
+        ) {
+          // full sync 或更新输入已经确认/替代该 intent 时，旧请求失败不能再回灌错误。
+          return true;
+        }
+        handleComposerDraftWriteFailure(write);
         throw error;
       }
-    });
-    write.result = result;
-    // 错误仍交给调用方；队列自身消化拒绝，使下一次写入可以继续。
+    );
+    write.result ||= result;
     composerDraftWriteTail = result.catch(() => undefined);
+    return result;
+  }
+
+  function retryDeferredComposerDraftWrites() {
+    if (composerDraftBridgeDisposed) return;
+    for (const write of [...pendingComposerDraftWrites]) {
+      if (write.retryTimer == null || write.inFlight) continue;
+      scheduler.clearTimeout(write.retryTimer);
+      write.retryTimer = null;
+      void queueComposerDraftWrite(write).catch(() => {});
+    }
+  }
+
+  /** 新输入按 thread 合并，并用有界重试维持乐观覆盖，直到匹配快照或显式回滚。 */
+  function forwardComposerDraftUpdate(payload) {
+    if (composerDraftBridgeDisposed) return Promise.resolve(false);
+    const entries = boundComposerDraftEntries(payload.recordUpdate.entries);
+    if (Object.keys(entries).length === 0) return Promise.resolve(false);
+    const recordUpdate = { ...payload.recordUpdate, entries };
+    const write = {
+      ackTimer: null,
+      attempts: 0,
+      inFlight: false,
+      payload: { ...payload, recordUpdate },
+      recordUpdate,
+      result: null,
+      retryTimer: null,
+    };
+    pendingComposerDraftWrites.push(write);
+    setPersistedAtomSnapshotValue(
+      COMPOSER_PROMPT_DRAFTS_KEY,
+      composerDraftValueWithPending(composerDraftHostRecord),
+      false
+    );
+    const result = queueComposerDraftWrite(write);
+    write.result = result;
+    // 新写入立即给退避中的旧 intent 一个重试机会，避免还要等完整 backoff。
+    retryDeferredComposerDraftWrites();
     return result;
   }
 
   /** 迟到的保存回包不能恢复已清空的编辑器，也不能覆盖用户正在输入的下一条消息。 */
   function reconcileComposerDraftUpdate(payload) {
-    let value = payload.deleted ? {} : payload.value;
-    const record = isPlainObject(value) ? value : {};
-    let acknowledged = -1;
-    const expectedEntries = new Map();
-    for (let index = 0; index < pendingComposerDraftWrites.length; index += 1) {
-      const write = pendingComposerDraftWrites[index];
-      if (!write.sent) break;
-      for (const [key, entry] of Object.entries(write.recordUpdate.entries)) expectedEntries.set(key, entry);
-      // 确认整个已发送前缀的最终条目，不能仅凭另一会话的相同值跳过尚未落盘的删除。
-      const entries = Array.from(expectedEntries.entries());
-      if (entries.length > 0 && entries.every(([key, entry]) =>
-        entry == null ? !Object.prototype.hasOwnProperty.call(record, key) :
-          JSON.stringify(record[key]) === JSON.stringify(entry.value))) acknowledged = index;
-    }
-    if (acknowledged >= 0) pendingComposerDraftWrites.splice(0, acknowledged + 1);
-    for (const write of pendingComposerDraftWrites) {
-      // 只覆盖待确认条目，宿主快照中的其他会话草稿继续同步。
-      value = mergeComposerDraftRecord(value, write.recordUpdate);
-    }
-    setPersistedAtomSnapshotValue(payload.key, value, !!payload.deleted && pendingComposerDraftWrites.length === 0);
-    return pendingComposerDraftWrites.length === 0 ? payload : { ...payload, value, deleted: false };
+    const reconciled = reconcileComposerDraftState(payload.deleted ? {} : payload.value, {
+      deleted: !!payload.deleted,
+    });
+    return pendingComposerDraftWrites.length === 0
+      ? { ...payload, value: reconciled.value }
+      : { ...payload, value: reconciled.value, deleted: false };
   }
 
   initializePersistedAtomSnapshot();
+  composerDraftHostRecord = isPlainObject(persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_KEY))
+    ? { ...persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_KEY) }
+    : {};
 
   // 官方 preload 在 renderer 执行前同步记录该时间；Web 侧同样固定为页面 timeOrigin，不能落入异步 IPC。
   const preloadStartedAtMs =
@@ -4066,6 +4265,7 @@
   modificationScope?.own?.(() => {
     // 页面替换后释放待确认草稿，旧请求不应继续写入新页面实例。
     composerDraftBridgeDisposed = true;
+    for (const write of pendingComposerDraftWrites) clearComposerDraftWriteTimers(write);
     pendingComposerDraftWrites.length = 0;
     settleWsReadyWaiters(false);
     rejectPendingGatewayIpc(new Error("Renderer page was replaced"));
