@@ -256,9 +256,16 @@ function makeResponseRecorder() {
     body: Buffer.alloc(0),
     headers: {},
     status: 0,
+    // 模拟 Node ServerResponse 的预写/删除 header，用于验证长缓存响应剥离 cookie 刷新。
+    setHeader(name, value) {
+      this.headers[String(name).toLowerCase()] = value;
+    },
+    removeHeader(name) {
+      delete this.headers[String(name).toLowerCase()];
+    },
     writeHead(status, headers) {
       this.status = status;
-      this.headers = headers || {};
+      this.headers = { ...this.headers, ...(headers || {}) };
     },
     end(body) {
       this.body = Buffer.isBuffer(body) ? body : Buffer.from(String(body || ""), "utf-8");
@@ -1670,6 +1677,47 @@ test("only caches content-hashed patched assets as immutable", (t) => {
   assert.match(dynamic.body.toString("utf-8"), /下载文件/);
   assert.equal(fixedName.headers["cache-control"], "no-store");
   assert.equal(legacy.headers["cache-control"], "no-store");
+});
+
+test("current 12-char content hashes stay immutable and public cache drops cookie refresh", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const assetsDir = path.join(webviewDir, "assets");
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.writeFileSync(path.join(assetsDir, "index-102d07b7ae6c.js"), "export const ready = true;");
+  fs.writeFileSync(path.join(assetsDir, "DocumentFormat.OpenXml.4g1x2psnat.wasm"), "wasm");
+  fs.writeFileSync(path.join(assetsDir, "dotnet.js"), "export const runtime = true;");
+  fs.writeFileSync(path.join(assetsDir, "index-102d07b7ae6c.html"), "<html>entry</html>");
+  const service = createService(webviewDir);
+
+  // 官方 rolldown 产物使用 12 位 hash；JS、点分隔的 WASM 都必须是 immutable。
+  const js = serveOfficialAssetResponse(service, `${PATCHED_OFFICIAL_PREFIX}assets/index-102d07b7ae6c.js`);
+  assert.equal(js.headers["cache-control"], "public, max-age=31536000, immutable");
+  const wasm = serveOfficialAssetResponse(
+    service,
+    `${PATCHED_OFFICIAL_PREFIX}assets/DocumentFormat.OpenXml.4g1x2psnat.wasm`
+  );
+  assert.equal(wasm.headers["cache-control"], "public, max-age=31536000, immutable");
+  // 即使入口文件带 hash，也不能被 immutable 固化，升级时必须立即重新读取。
+  const html = serveOfficialAssetResponse(
+    service,
+    `${PATCHED_OFFICIAL_PREFIX}assets/index-102d07b7ae6c.html`
+  );
+  assert.equal(html.headers["cache-control"], "no-store");
+
+  // 长缓存（public）响应必须剥离 auth gate 预写的 Set-Cookie，否则浏览器无法复用缓存。
+  const hashedPath = `${PATCHED_OFFICIAL_PREFIX}assets/index-102d07b7ae6c.js`;
+  const cacheableRes = makeResponseRecorder();
+  cacheableRes.setHeader("set-cookie", "codex_web_session=token; HttpOnly; Path=/; SameSite=Lax");
+  service.serveFile({ headers: { host: "localhost:3737" } }, cacheableRes, service.staticFile(hashedPath), 200, hashedPath);
+  assert.equal(cacheableRes.headers["cache-control"], "public, max-age=31536000, immutable");
+  assert.equal(cacheableRes.headers["set-cookie"], undefined);
+
+  // 非长缓存响应保留 cookie 刷新，登录态 TTL 续期不受影响。
+  const fixedPath = `${PATCHED_OFFICIAL_PREFIX}assets/dotnet.js`;
+  const privateRes = makeResponseRecorder();
+  privateRes.setHeader("set-cookie", "codex_web_session=token; HttpOnly; Path=/; SameSite=Lax");
+  service.serveFile({ headers: { host: "localhost:3737" } }, privateRes, service.staticFile(fixedPath), 200, fixedPath);
+  assert.match(String(privateRes.headers["set-cookie"]), /codex_web_session=/);
 });
 
 test("patched asset cache coalesces asynchronous compression and reuses it for ETag validation", async (t) => {
