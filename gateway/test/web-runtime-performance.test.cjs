@@ -65,11 +65,12 @@ function sourceSection(source, startMarker, endMarker) {
   return normalizedSource.slice(start, end);
 }
 
-function createComposerDraftHarness() {
+function createComposerDraftHarness(options = {}) {
   const emitted = [];
   const toasts = [];
   const context = {
     OPENCODEX_LOCALE: "en-US",
+    composerDraftInitialSnapshot: options.persistedAtomSnapshot || {},
     emitPersistedAtomUpdated: (...args) => emitted.push(args),
     rollbackEvents: emitted,
     showBridgeToast: (payload) => toasts.push(payload),
@@ -80,6 +81,12 @@ function createComposerDraftHarness() {
       const persistedAtomSnapshot = new Map();
       const PERSISTED_ATOM_SNAPSHOT_MAX_ENTRIES = 512;
       const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set();
+      const cfg = { persistedAtomSnapshot: composerDraftInitialSnapshot };
+      const WINDOW_FOCUS_CHANGED_MESSAGE = "window-focus-changed";
+      const document = {
+        visibilityState: "visible",
+        hasFocus: () => true,
+      };
       const writes = [];
       let currentTime = 0;
       let nextTimerId = 1;
@@ -129,16 +136,28 @@ function createComposerDraftHarness() {
       )}
       ${sourceSection(
         BRIDGE_SOURCE,
+        "  function initializePersistedAtomSnapshot",
+        "\n\n  /** 立即给官方 renderer"
+      )}
+      ${sourceSection(
+        BRIDGE_SOURCE,
+        "  function mergeComposerDraftHostRecords",
+        "\n\n  /** shared-object snapshot"
+      )}
+      ${sourceSection(
+        BRIDGE_SOURCE,
         "  /** 合并官方文本草稿",
         "\n\n  initializePersistedAtomSnapshot();"
       )}
+      ${sourceSection(
+        BRIDGE_SOURCE,
+        "  function browserRendererMessagePayload",
+        "\n\n  /** 页面 focus 或可见性变化时"
+      )}
+      initializePersistedAtomSnapshot();
       return {
         advance: advanceTimers,
-        dispose() {
-          composerDraftBridgeDisposed = true;
-          for (const write of pendingComposerDraftWrites) clearComposerDraftWriteTimers(write);
-          pendingComposerDraftWrites.length = 0;
-        },
+        dispose: disposeComposerDraftState,
         clearTimer,
         emitted: () => rollbackEvents.slice(),
         entryCount: pendingComposerDraftEntryCount,
@@ -154,7 +173,9 @@ function createComposerDraftHarness() {
         reconcile: reconcileComposerDraftUpdate,
         reconcileState: reconcileComposerDraftState,
         snapshot: () => Object.fromEntries(persistedAtomSnapshot.entries()),
+        sync: browserRendererMessagePayload,
         setTimer,
+        timerCount: () => timers.size,
         update: forwardComposerDraftUpdate,
         writes,
       };
@@ -1960,17 +1981,26 @@ test("composer draft clear survives an older host acknowledgement", async () => 
 test("composer draft page replacement prevents queued writes from reaching the next page", async () => {
   const drafts = createComposerDraftHarness();
   const pendingWrite = drafts.update(composerDraftUpdate("thread-one", "page one"));
+  await nextTurn();
+  drafts.writes[0].resolve(true);
+  assert.equal(await pendingWrite, true);
+  assert.equal(drafts.timerCount(), 1, "the pending write should hold an acknowledgement timer");
+  const sentBeforeDispose = drafts.writes.length;
   drafts.dispose();
 
-  assert.equal(await pendingWrite, false);
   await nextTurn();
-  assert.equal(drafts.writes.length, 0);
+  assert.equal(drafts.writes.length, sentBeforeDispose);
   assert.equal(await drafts.update(composerDraftUpdate("thread-one", "page two")), false);
-  assert.equal(drafts.writes.length, 0);
+  assert.equal(drafts.writes.length, sentBeforeDispose);
   assert.equal(drafts.pending().length, 0);
+  assert.equal(drafts.timerCount(), 0);
   assert.match(
     BRIDGE_SOURCE,
-    /composerDraftBridgeDisposed = true;[\s\S]{0,180}pendingComposerDraftWrites\.length = 0;/
+    /function disposeComposerDraftState\(\)[\s\S]{0,160}clearComposerDraftWriteTimers\(write\);[\s\S]{0,160}pendingComposerDraftWrites\.length = 0;/
+  );
+  assert.match(
+    BRIDGE_SOURCE,
+    /modificationScope\?\.own\?\.\(\(\) => \{[\s\S]{0,180}disposeComposerDraftState\(\);/
   );
 });
 
@@ -2049,6 +2079,121 @@ test("composer draft gives up with an explicit rollback and toast", async () => 
   assert.equal(Object.keys(drafts.snapshot()["composer-prompt-drafts-v2"]).length, 0);
   assert.equal(drafts.emitted().at(-1)[0], "composer-prompt-drafts-v2");
   assert.equal(drafts.toasts().length, 1);
+});
+
+test("composer draft ack timeout retries at exactly 5000ms and eventually abandons", async () => {
+  const drafts = createComposerDraftHarness();
+  const first = drafts.update(composerDraftUpdate("thread-one", "echo missing"));
+  await nextTurn();
+  drafts.writes[0].resolve(true);
+  await first;
+
+  drafts.advance(4999);
+  await nextTurn();
+  assert.equal(drafts.writes.length, 1);
+  assert.equal(drafts.timerCount(), 1);
+
+  drafts.advance(1);
+  await nextTurn();
+  assert.equal(drafts.writes.length, 1);
+  assert.equal(drafts.timerCount(), 1, "the ack timeout should schedule one retry timer");
+
+  for (const [writeIndex, retryDelay] of [[1, 250], [2, 500], [3, 1000]]) {
+    drafts.advance(retryDelay);
+    await nextTurn();
+    assert.equal(drafts.writes.length, writeIndex + 1);
+    drafts.writes[writeIndex].resolve(true);
+    await nextTurn();
+    drafts.advance(5000);
+    await nextTurn();
+  }
+
+  assert.equal(drafts.writes.length, 4);
+  assert.equal(drafts.entryCount(), 0);
+  assert.equal(drafts.pending().length, 0);
+  assert.equal(drafts.timerCount(), 0);
+  assert.equal(drafts.toasts().length, 1);
+});
+
+test("composer draft rollback from a legacy-only snapshot retains unrelated threads", async () => {
+  const drafts = createComposerDraftHarness({
+    persistedAtomSnapshot: {
+      "composer-prompt-drafts": {
+        "thread-current": "legacy-current",
+        "thread-other": "legacy-other",
+      },
+    },
+  });
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-other"], "legacy-other");
+
+  const failed = drafts.update(composerDraftUpdate("thread-current", "never saved"));
+  await nextTurn();
+  drafts.writes[0].reject(new Error("failure 1"));
+  await assert.rejects(failed, /failure 1/);
+
+  for (const [index, delay] of [[1, 250], [2, 500], [3, 1000]]) {
+    drafts.advance(delay);
+    await nextTurn();
+    drafts.writes[index].reject(new Error(`failure ${index + 1}`));
+    await nextTurn();
+  }
+
+  const restored = drafts.snapshot()["composer-prompt-drafts-v2"];
+  assert.equal(restored["thread-current"], "legacy-current");
+  assert.equal(restored["thread-other"], "legacy-other");
+  assert.equal(drafts.entryCount(), 0);
+  assert.equal(drafts.toasts().length, 1);
+});
+
+test("composer draft full sync merges legacy drafts with v2 precedence", () => {
+  const drafts = createComposerDraftHarness({
+    persistedAtomSnapshot: {
+      "composer-prompt-drafts": {
+        "thread-current": "legacy-current",
+        "thread-other": "legacy-other",
+      },
+      "composer-prompt-drafts-v2": {
+        "thread-current": "v2-current",
+      },
+    },
+  });
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-current"], "v2-current");
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-other"], "legacy-other");
+
+  const synced = drafts.sync("persisted-atom-sync", {
+    state: {
+      "composer-prompt-drafts": {
+        "thread-current": "legacy-current",
+        "thread-other": "legacy-other",
+      },
+      "composer-prompt-drafts-v2": {
+        "thread-current": "new-v2-current",
+      },
+    },
+  });
+  assert.equal(synced.state["composer-prompt-drafts-v2"]["thread-current"], "new-v2-current");
+  assert.equal(synced.state["composer-prompt-drafts-v2"]["thread-other"], "legacy-other");
+  assert.equal(synced.state["composer-prompt-drafts"]["thread-current"], "legacy-current");
+
+  const legacyOnly = createComposerDraftHarness({
+    persistedAtomSnapshot: {
+      "composer-prompt-drafts": {
+        "thread-current": "legacy-only-current",
+        "thread-other": "legacy-only-other",
+      },
+    },
+  });
+  const legacySynced = legacyOnly.sync("persisted-atom-sync", {
+    state: {
+      "composer-prompt-drafts": {
+        "thread-current": "legacy-only-current",
+        "thread-other": "legacy-only-other",
+      },
+    },
+  });
+  assert.equal(legacySynced.state["composer-prompt-drafts-v2"]["thread-current"], "legacy-only-current");
+  assert.equal(legacySynced.state["composer-prompt-drafts-v2"]["thread-other"], "legacy-only-other");
+  assert.equal(legacySynced.state["composer-prompt-drafts"]["thread-other"], "legacy-only-other");
 });
 
 test("composer draft full sync acknowledges persisted intents before applying overrides", async () => {

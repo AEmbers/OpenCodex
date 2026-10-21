@@ -1480,20 +1480,24 @@
   function browserRendererMessagePayload(channel, payload) {
     if (channel === "persisted-atom-sync") {
       // 全量快照也走与增量回包相同的累计确认，已落盘条目必须先移出 pending。
+      const hasLegacyDrafts =
+        payload?.state &&
+        Object.prototype.hasOwnProperty.call(payload.state, COMPOSER_PROMPT_DRAFTS_LEGACY_KEY);
       const hasHostDrafts =
         payload?.state &&
         Object.prototype.hasOwnProperty.call(payload.state, COMPOSER_PROMPT_DRAFTS_KEY);
-      if (hasHostDrafts || pendingComposerDraftWrites.length > 0) {
+      if (hasLegacyDrafts || hasHostDrafts || pendingComposerDraftWrites.length > 0) {
+        // v2 与旧键可能同时存在；以 v2 同名会话为准，同时保留旧快照独有的会话。
+        const hostRecord = mergeComposerDraftHostRecords(
+          hasLegacyDrafts ? payload.state[COMPOSER_PROMPT_DRAFTS_LEGACY_KEY] : {},
+          hasHostDrafts ? payload.state[COMPOSER_PROMPT_DRAFTS_KEY] : {}
+        );
         const reconciled = reconcileComposerDraftState(
-          hasHostDrafts ? payload.state[COMPOSER_PROMPT_DRAFTS_KEY] : {},
+          hostRecord,
           { deleted: false }
         );
         const state = { ...payload.state };
-        if (hasHostDrafts || pendingComposerDraftWrites.length > 0) {
-          state[COMPOSER_PROMPT_DRAFTS_KEY] = reconciled.value;
-        } else {
-          delete state[COMPOSER_PROMPT_DRAFTS_KEY];
-        }
+        state[COMPOSER_PROMPT_DRAFTS_KEY] = reconciled.value;
         return { ...payload, state };
       }
     }
@@ -3136,6 +3140,7 @@
   const sharedObjectSnapshot = new Map();
   const persistedAtomSnapshot = new Map();
   const COMPOSER_PROMPT_DRAFTS_KEY = "composer-prompt-drafts-v2";
+  const COMPOSER_PROMPT_DRAFTS_LEGACY_KEY = "composer-prompt-drafts";
   const COMPOSER_DRAFT_PENDING_MAX_ENTRIES = 64;
   const COMPOSER_DRAFT_WRITE_MAX_ATTEMPTS = 4;
   const COMPOSER_DRAFT_RETRY_BASE_MS = 250;
@@ -3178,6 +3183,14 @@
   /** 判断普通对象。 */
   function isPlainObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  /** 旧版草稿键只作为基线；v2 存在同一会话时必须以 v2 为准。 */
+  function mergeComposerDraftHostRecords(legacyValue, v2Value) {
+    return {
+      ...(isPlainObject(legacyValue) ? legacyValue : {}),
+      ...(isPlainObject(v2Value) ? v2Value : {}),
+    };
   }
 
   /** shared-object snapshot 写入前补齐 Web 必需的已知形态。 */
@@ -3292,6 +3305,16 @@
     for (const [key, value] of Object.entries(snapshot)) {
       setPersistedAtomSnapshotValue(key, value, false);
     }
+    const hasLegacyDrafts = persistedAtomSnapshot.has(COMPOSER_PROMPT_DRAFTS_LEGACY_KEY);
+    const hasV2Drafts = persistedAtomSnapshot.has(COMPOSER_PROMPT_DRAFTS_KEY);
+    composerDraftHostRecord = mergeComposerDraftHostRecords(
+      persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_LEGACY_KEY),
+      persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_KEY)
+    );
+    // 启动时立即把旧快照升级到 v2，后续写入与回滚只需处理同一份宿主基线。
+    if (hasLegacyDrafts || hasV2Drafts) {
+      setPersistedAtomSnapshotValue(COMPOSER_PROMPT_DRAFTS_KEY, composerDraftHostRecord, false);
+    }
   }
 
   /** 立即给官方 renderer 回 persisted-atom-sync，消除启动期固定 5 秒等待。 */
@@ -3333,6 +3356,13 @@
     if (write.ackTimer != null) scheduler.clearTimeout(write.ackTimer);
     write.retryTimer = null;
     write.ackTimer = null;
+  }
+
+  /** 页面替换时统一终止草稿队列，确保旧页面的重试与确认定时器全部释放。 */
+  function disposeComposerDraftState() {
+    composerDraftBridgeDisposed = true;
+    for (const write of pendingComposerDraftWrites) clearComposerDraftWriteTimers(write);
+    pendingComposerDraftWrites.length = 0;
   }
 
   function pruneEmptyComposerDraftWrites() {
@@ -3572,9 +3602,6 @@
   }
 
   initializePersistedAtomSnapshot();
-  composerDraftHostRecord = isPlainObject(persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_KEY))
-    ? { ...persistedAtomSnapshot.get(COMPOSER_PROMPT_DRAFTS_KEY) }
-    : {};
 
   // 官方 preload 在 renderer 执行前同步记录该时间；Web 侧同样固定为页面 timeOrigin，不能落入异步 IPC。
   const preloadStartedAtMs =
@@ -4264,9 +4291,7 @@
 
   modificationScope?.own?.(() => {
     // 页面替换后释放待确认草稿，旧请求不应继续写入新页面实例。
-    composerDraftBridgeDisposed = true;
-    for (const write of pendingComposerDraftWrites) clearComposerDraftWriteTimers(write);
-    pendingComposerDraftWrites.length = 0;
+    disposeComposerDraftState();
     settleWsReadyWaiters(false);
     rejectPendingGatewayIpc(new Error("Renderer page was replaced"));
     activeBrowserFilePickerCancel?.();
