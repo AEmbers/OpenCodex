@@ -370,7 +370,7 @@ test("public compatibility API exposes only the read-only sanitized snapshot", (
     service,
   ), true);
   assert.equal(getResponse.status, 200);
-  assert.equal(JSON.parse(getResponse.body).compatibility.points.length, 104);
+  assert.equal(JSON.parse(getResponse.body).compatibility.points.length, 105);
 
   const reportResponse = responseRecorder();
   assert.equal(handlePublicRuntimeCompatibilityApi(
@@ -402,7 +402,7 @@ test("authenticated API accepts only validated Browser Kernel reports", async ()
     service,
   ), true);
   assert.equal(getResponse.status, 200);
-  assert.equal(JSON.parse(getResponse.body).compatibility.points.length, 104);
+  assert.equal(JSON.parse(getResponse.body).compatibility.points.length, 105);
 
   const point = browserKernelPoint("web.runtime.bridge.desktop-api", { active: true });
   const reportResponse = responseRecorder();
@@ -473,7 +473,7 @@ test("authenticated Browser reports merge external Plugin SDK points into diagno
 
   assert.equal(response.status, 200);
   const snapshot = service.snapshot();
-  assert.equal(snapshot.points.length, 105);
+  assert.equal(snapshot.points.length, 106);
   assert.deepEqual(
     snapshot.points.find((point) => point.id === fixture.point.id).plugin,
     fixture.catalog.plugin,
