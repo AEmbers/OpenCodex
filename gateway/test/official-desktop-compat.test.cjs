@@ -19,6 +19,7 @@ const { OfficialRuntimeOptimizer } = require("../dist/official/OfficialRuntimeOp
 const {
   configureHiddenRuntimeCommandLine,
   configureHiddenRuntimeEnvironment,
+  headlessRuntimeCommandLineArgs,
   hiddenRuntimeGcmCommandLineArgs,
   isolateHiddenRuntimeGcmStore,
   isolateHiddenRuntimeGcmStoresForUserData,
@@ -260,6 +261,23 @@ test("hidden gateway disables Web Push without dropping existing Chromium featur
   // 重复初始化不得堆叠同名特性，保证开发重载和测试环境行为稳定。
   assert.deepEqual(configureHiddenRuntimeCommandLine(app, { PORT: "43895" }), ["ExistingFeature", "PushMessaging"]);
   assert.deepEqual(configureHiddenRuntimeCommandLine(null), []);
+});
+
+test("headless Electron arguments stay opt-in and accept explicit truthy values", () => {
+  // 桌面端缺省必须保持空参数，避免无意中改变 Electron 的窗口、沙箱和 GPU 行为。
+  assert.deepEqual(headlessRuntimeCommandLineArgs({}), []);
+  assert.deepEqual(headlessRuntimeCommandLineArgs({ OPENCODEX_HEADLESS_ELECTRON: "0" }), []);
+  assert.deepEqual(headlessRuntimeCommandLineArgs({ OPENCODEX_HEADLESS_ELECTRON: "false" }), []);
+  assert.deepEqual(headlessRuntimeCommandLineArgs(null), []);
+
+  // 无头 Linux 部署显式开启后，launcher 和 dev runner 共用同一组启动参数。
+  for (const value of ["1", "true", "YES", "on"]) {
+    assert.deepEqual(headlessRuntimeCommandLineArgs({ OPENCODEX_HEADLESS_ELECTRON: value }), [
+      "--no-sandbox",
+      "--headless",
+      "--disable-gpu",
+    ]);
+  }
 });
 
 test("hidden gateway preserves the original GCM store once and removes only transient copies", (t) => {
