@@ -153,6 +153,95 @@ test("Statsig net.fetch bounds hangs and honors explicit offline fallback", asyn
   assert.equal(offline.intercepted[0].reason, "offline");
 });
 
+test("Statsig net.fetch treats non-2xx and malformed initialize responses as fallback candidates", async (t) => {
+  for (const fixture of [
+    { body: "forbidden", reason: "http_403", status: 403 },
+    { body: "server failure", reason: "http_500", status: 500 },
+    { body: "not-json", reason: "malformed_response", status: 200 },
+    { body: "{}", reason: "malformed_response", status: 200 },
+    { body: "[]", reason: "malformed_response", status: 200 },
+  ]) {
+    const { hookedNet, intercepted } = createStatsigNetHarness(t, {
+      fetch: async () => new Response(fixture.body, { status: fixture.status }),
+    });
+    const response = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+    const payload = JSON.parse(await response.text());
+    assert.equal(payload.has_updates, true);
+    assert.equal(intercepted.at(-1).reason, fixture.reason);
+  }
+});
+
+test("Statsig net.fetch rejects external aborts without producing a synthetic response", async (t) => {
+  const preAborted = createStatsigNetHarness(t, {
+    fetch: async () => {
+      throw new Error("pre-aborted fetch must not run");
+    },
+  });
+  const preAbortController = new AbortController();
+  preAbortController.abort();
+  await assert.rejects(
+    preAborted.hookedNet.fetch("https://ab.chatgpt.com/v1/initialize", {
+      signal: preAbortController.signal,
+    }),
+    (error) => error?.name === "AbortError"
+  );
+  assert.equal(preAborted.calls.length, 0);
+  assert.equal(preAborted.intercepted.length, 0);
+
+  let nativeSignal = null;
+  const inFlight = createStatsigNetHarness(t, {
+    fetch: (_url, init) =>
+      new Promise((_resolve, reject) => {
+        nativeSignal = init.signal;
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      }),
+  });
+  const controller = new AbortController();
+  const pending = inFlight.hookedNet.fetch("https://ab.chatgpt.com/v1/initialize", {
+    signal: controller.signal,
+  });
+  await Promise.resolve();
+  controller.abort();
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+  assert.equal(nativeSignal.aborted, true);
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  assert.equal(inFlight.intercepted.length, 0, "external abort must cancel the fallback timer");
+
+  const rejected = createStatsigNetHarness(t, {
+    fetch: async () => {
+      throw new Error("ECONNRESET");
+    },
+  });
+  const rejectedController = new AbortController();
+  const rejectedPending = rejected.hookedNet.fetch("https://ab.chatgpt.com/v1/initialize", {
+    signal: rejectedController.signal,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  rejectedController.abort();
+  await assert.rejects(rejectedPending, (error) => error?.name === "AbortError");
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  assert.equal(
+    rejected.intercepted.length,
+    0,
+    "external abort must also cancel a fallback scheduled after network rejection"
+  );
+});
+
+test("Statsig net.fetch timeout aborts the native request before returning fallback", async (t) => {
+  let nativeSignal = null;
+  const { hookedNet, intercepted } = createStatsigNetHarness(t, {
+    fetch: (_url, init) =>
+      new Promise((_resolve, reject) => {
+        nativeSignal = init.signal;
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      }),
+  });
+  const response = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize");
+  assert.equal(nativeSignal.aborted, true);
+  assert.equal((await response.json()).has_updates, true);
+  assert.equal(intercepted.at(-1).reason, "timeout");
+});
+
 test("Statsig timing policy rejects invalid values and caps oversized environment values", () => {
   const safe = resolveStatsigNetworkPolicy({
     OPENCODEX_STATSIG_INITIALIZE_DELAY_MS: "invalid",
@@ -189,7 +278,10 @@ test("Statsig IPC coordinator preserves success and emits bounded fallback proto
         initializeTimeoutMs: 200,
         offlineFallback,
       },
-      sendFallback: (response, details) => sent.push({ response, details }),
+      sendFallback: (response, details) => {
+        sent.push({ response, details });
+        return true;
+      },
       now: clock.now,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
@@ -202,16 +294,27 @@ test("Statsig IPC coordinator preserves success and emits bounded fallback proto
   };
 
   const online = createCoordinator();
-  assert.deepEqual(online.beforeInvoke(channel, channel, [initializeMessage]), {
+  const successfulDispatch = online.beforeInvoke(channel, channel, [initializeMessage]);
+  assert.deepEqual(successfulDispatch, {
     handled: false,
     kind: "initialize",
     requestId: "request-1",
   });
   assert.deepEqual(
     online.observeOutgoing(channel, channel, [
-      { type: "fetch-response", requestId: "request-1", responseType: "success", status: 200 },
+      {
+        type: "fetch-response",
+        requestId: "request-1",
+        responseType: "success",
+        status: 200,
+        bodyJsonString: '{"has_updates":false}',
+      },
     ]),
     { suppress: false, requestId: "request-1" }
+  );
+  assert.equal(
+    online.handlerFailed(successfulDispatch, new Error("late handler rejection")).alreadySettled,
+    true
   );
   clock.advance(250);
   assert.equal(sent.length, 0, "a real success response must cancel the synthetic fallback");
@@ -277,12 +380,144 @@ test("Statsig IPC coordinator preserves success and emits bounded fallback proto
   assert.equal(sent[2].details.reason, "offline");
 });
 
+test("Statsig IPC invalid initialize responses use the same 400ms fallback deadline", () => {
+  for (const fixture of [
+    { reason: "http_403", response: { status: 403, bodyJsonString: "{}" } },
+    { reason: "http_500", response: { status: 500, bodyJsonString: "{}" } },
+    { reason: "malformed_response", response: { status: 200, bodyJsonString: "not-json" } },
+    { reason: "malformed_response", response: { status: 200, bodyJsonString: "{}" } },
+    { reason: "malformed_response", response: { status: 200, bodyJsonString: "[]" } },
+  ]) {
+    const clock = createFakeStatsigClock();
+    const sent = [];
+    const coordinator = createStatsigIpcFallbackCoordinator({
+      policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: false },
+      sendFallback: (response, details) => {
+        sent.push({ response, details });
+        return true;
+      },
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    const channel = "message-from-view";
+    const dispatch = coordinator.beforeInvoke(channel, channel, [
+      {
+        type: "fetch",
+        requestId: `invalid-${fixture.reason}`,
+        url: "https://ab.chatgpt.com/v1/initialize",
+      },
+    ]);
+    assert.equal(dispatch.handled, false);
+    assert.deepEqual(
+      coordinator.observeOutgoing(channel, channel, [
+        {
+          type: "fetch-response",
+          requestId: dispatch.requestId,
+          responseType: "success",
+          ...fixture.response,
+        },
+      ]),
+      { suppress: true, requestId: dispatch.requestId }
+    );
+    clock.advance(99);
+    assert.equal(sent.length, 0);
+    clock.advance(1);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].details.reason, fixture.reason);
+  }
+});
+
+test("Statsig IPC handler rejection finalizes to one fallback response", () => {
+  const clock = createFakeStatsigClock();
+  const sent = [];
+  const coordinator = createStatsigIpcFallbackCoordinator({
+    policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: false },
+    sendFallback: (response, details) => {
+      sent.push({ response, details });
+      return true;
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const channel = "message-from-view";
+  const dispatch = coordinator.beforeInvoke(channel, channel, [
+    {
+      type: "fetch",
+      requestId: "handler-rejected",
+      url: "https://ab.chatgpt.com/v1/initialize",
+    },
+  ]);
+  clock.advance(25);
+  assert.deepEqual(coordinator.handlerFailed(dispatch, new Error("handler rejected")), {
+    handled: true,
+    requestId: "handler-rejected",
+  });
+  assert.equal(coordinator.handlerFailed(dispatch, new Error("duplicate rejection")).handled, true);
+  clock.advance(74);
+  assert.equal(sent.length, 0);
+  clock.advance(1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].details.reason, "handler_error");
+  clock.advance(500);
+  assert.equal(sent.length, 1, "handler rejection must not emit IPC error plus a later success");
+});
+
+test("Statsig IPC keeps failed fallback deliveries recoverable until a real send succeeds", () => {
+  const clock = createFakeStatsigClock();
+  const attempts = [];
+  const coordinator = createStatsigIpcFallbackCoordinator({
+    policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: true },
+    sendFallback: (response, details) => {
+      attempts.push({ response, details });
+      return attempts.length > 1;
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const channel = "message-from-view";
+  const dispatch = coordinator.beforeInvoke(channel, channel, [
+    {
+      type: "fetch",
+      requestId: "send-retry",
+      url: "https://ab.chatgpt.com/v1/initialize",
+    },
+  ]);
+  assert.equal(dispatch.handled, true);
+
+  clock.advance(100);
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(coordinator.pendingState("send-retry"), {
+    deliveryFailures: 1,
+    deliveryState: "pending",
+    reason: "offline",
+  });
+  assert.equal(coordinator.failedDeliveryState("send-retry").deliveryFailures, 1);
+
+  clock.advance(99);
+  assert.equal(attempts.length, 1);
+  clock.advance(1);
+  assert.equal(attempts.length, 2);
+  assert.equal(coordinator.pendingState("send-retry"), null);
+  assert.deepEqual(
+    coordinator.observeOutgoing(channel, channel, [
+      { type: "fetch-response", requestId: "send-retry", responseType: "success" },
+    ]),
+    { suppress: true, requestId: "send-retry" }
+  );
+});
+
 test("Statsig IPC exact matches swallow telemetry and pass all other fetch routes", () => {
   const clock = createFakeStatsigClock();
   const sent = [];
   const coordinator = createStatsigIpcFallbackCoordinator({
     policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: false },
-    sendFallback: (response) => sent.push(response),
+    sendFallback: (response) => {
+      sent.push(response);
+      return true;
+    },
     now: clock.now,
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,

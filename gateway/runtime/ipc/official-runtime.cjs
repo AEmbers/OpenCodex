@@ -1519,7 +1519,7 @@ const statsigIpcFallbackCoordinator = createStatsigIpcFallbackCoordinator({
   },
   sendFallback(response) {
     // 合成响应本身也要经过统一 WS 路由，但不能再次被出站观察器当成官方回包吞掉。
-    routeOfficialWebContentsSend(
+    return routeOfficialWebContentsSend(
       MESSAGE_FOR_VIEW_CHANNEL,
       [response],
       officialIpc.hiddenWebContents,
@@ -2233,12 +2233,23 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
   logDesktopFeatureAvailability(channel, invokeArgs);
   const handler = officialIpc.handlers.get(channel);
   if (handler) {
-    return handler(event, ...invokeArgs);
+    try {
+      return await handler(event, ...invokeArgs);
+    } catch (error) {
+      // handler 失败后只保留一个终态：已登记 Statsig initialize 时转为延迟合成响应并吞掉 IPC 异常。
+      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) return true;
+      throw error;
+    }
   }
   const listeners = officialIpc.listeners.get(channel);
   if (listeners && listeners.size > 0) {
-    for (const listener of [...listeners]) {
-      await listener(event, ...invokeArgs);
+    try {
+      for (const listener of [...listeners]) {
+        await listener(event, ...invokeArgs);
+      }
+    } catch (error) {
+      if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, error).handled) return true;
+      throw error;
     }
     return event.returnValue === undefined ? true : event.returnValue;
   }
@@ -2249,7 +2260,11 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
     registeredHandlers: Array.from(officialIpc.handlers.keys()).sort(),
     registeredListeners: Array.from(officialIpc.listeners.keys()).sort(),
   });
-  throw new Error(`No official Electron IPC handler for ${channel}`);
+  const missingHandlerError = new Error(`No official Electron IPC handler for ${channel}`);
+  if (statsigIpcFallbackCoordinator.handlerFailed(statsigDispatch, missingHandlerError).handled) {
+    return true;
+  }
+  throw missingHandlerError;
 }
 
 // 官方 AppHost 会把清理器挂在共享 WebContents 的 destroyed 事件上。每次连接必须独立

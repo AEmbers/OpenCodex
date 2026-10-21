@@ -6,9 +6,13 @@ const {
   buildStatsigInitializeResponse,
   buildStatsigLocalBody,
   classifyStatsigRequestUrl,
+  createStatsigAbortError,
+  extractAbortSignalFromFetchArgs,
   preferNativeStatsigInitialize,
   resolveStatsigNetworkPolicy,
+  validateStatsigInitializeNetResponse,
   waitForStatsigInitializeDelay,
+  withStatsigAbortSignal,
 } = require("./statsig-network-resilience.cjs");
 
 // Electron main 的 net.fetch 是官方隐藏 renderer 所有 Statsig/遥测请求的最终出口。
@@ -74,6 +78,7 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
       const url = extractUrlFromNetFetchArgs(args);
       const kind = classifyStatsigRequestUrl(url);
       if (!kind) return nativeFetch(...args);
+      const externalSignal = extractAbortSignalFromFetchArgs(args);
       const startedAt = Date.now();
       const recordFallback = (reason) => {
         if (onIntercept) onIntercept(url, { kind, reason });
@@ -89,15 +94,20 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
       };
 
       if (kind !== "initialize") return Promise.resolve(deliverLocal());
+      if (externalSignal?.aborted) return Promise.reject(createStatsigAbortError(externalSignal));
       if (policy.offlineFallback) {
-        return waitForStatsigInitializeDelay(startedAt, policy.initializeDelayMs).then(() =>
-          deliverLocal("offline")
-        );
+        return waitForStatsigInitializeDelay(startedAt, policy.initializeDelayMs, {
+          signal: externalSignal,
+        }).then(() => deliverLocal("offline"));
       }
 
+      const timeoutController = new AbortController();
+      const nativeArgs = withStatsigAbortSignal(args, timeoutController.signal);
       let nativePromise;
       try {
-        nativePromise = Promise.resolve(nativeFetch(...args));
+        nativePromise = Promise.resolve(nativeFetch(...nativeArgs)).then(
+          validateStatsigInitializeNetResponse
+        );
       } catch (error) {
         nativePromise = Promise.reject(error);
       }
@@ -107,6 +117,8 @@ function installOfficialNetFetchStatsigHook(electronModule, options = {}) {
         delayMs: policy.initializeDelayMs,
         timeoutMs: policy.initializeTimeoutMs,
         fallbackFactory: (reason) => deliverLocal(reason),
+        externalSignal,
+        abortNative: (reason) => timeoutController.abort(reason),
       }).then((result) => result.response);
     },
   });
