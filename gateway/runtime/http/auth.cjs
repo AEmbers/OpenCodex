@@ -260,27 +260,36 @@ function bearerToken(value) {
   return match ? match[1].trim() : "";
 }
 
-function authTokenFromRequest(req, url = null) {
-  // token 来源按显式 header、Authorization、query、cookie 排序，方便 CLI/浏览器各自接入。
+function authTokensFromRequest(req, url = null) {
+  // 认证入口可能同时收到显式 header、Authorization、WS query 和 HttpOnly cookie。
   const headerToken = String(headerValue(req.headers, "x-codex-web-token") || "").trim();
-  if (headerToken) return headerToken;
   const authorizationToken = bearerToken(headerValue(req.headers, "authorization"));
-  if (authorizationToken) return authorizationToken;
   const queryToken = url && url.searchParams ? String(url.searchParams.get("token") || "").trim() : "";
-  if (queryToken) return queryToken;
   const cookies = parseCookies(req.headers.cookie || "");
-  return String(cookies[COOKIE_NAME] || "").trim();
+  const cookieToken = String(cookies[COOKIE_NAME] || "").trim();
+  // 同一请求里不同来源可能是不同签发批次的 token；保留顺序并去重，供调用方逐个验证。
+  return [headerToken, authorizationToken, queryToken, cookieToken].filter(
+    (token, index, tokens) => token && tokens.indexOf(token) === index
+  );
 }
 
 function authResultForRequest(req, url = null) {
   // 没配置密码时 gateway 处于无认证模式，保持本地开发默认可用。
   if (!AUTH_PASSWORD_HASH) return { authRequired: false, authenticated: true, token: "", expiresAtMs: null };
-  const token = authTokenFromRequest(req, url);
-  const entry = authStore.validate(token);
+  const tokens = authTokensFromRequest(req, url);
+  let token = "";
+  let entry = null;
+  for (const candidate of tokens) {
+    entry = authStore.validate(candidate);
+    if (entry) {
+      token = candidate;
+      break;
+    }
+  }
   return {
     authRequired: true,
     authenticated: !!entry,
-    token,
+    token: entry ? token : tokens[0] || "",
     expiresAtMs: entry ? entry.expiresAtMs : null,
   };
 }

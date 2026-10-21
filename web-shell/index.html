@@ -593,6 +593,7 @@
     <script>
       (() => {
         const forceLoginKey = "codex_web_force_login";
+        const runtimeAuthTokenStorageKey = "codex_web_auth_token";
         const pluginSystem = window.OpenCodexPluginSystem || window.__OpenCodexPluginSystem || null;
         const runtimeConfig = window.__CODEX_WEB_CONFIG__ || {};
         const locale = runtimeConfig.locale || "zh-CN";
@@ -827,17 +828,36 @@
         }
 
         function storedToken() {
-          return runtimeAuthToken;
+          if (runtimeAuthToken) return runtimeAuthToken;
+          try {
+            // sessionStorage 只在当前标签页生命周期内保留 token，用于文档替换和刷新时把短期凭证交给新页面。
+            const token = String(sessionStorage.getItem(runtimeAuthTokenStorageKey) || "").trim();
+            if (!token) return "";
+            runtimeAuthToken = token;
+            window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = token;
+            return token;
+          } catch {
+            return "";
+          }
         }
 
         function storeToken(token) {
-          runtimeAuthToken = token || "";
+          runtimeAuthToken = String(token || "").trim();
           window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = runtimeAuthToken;
+          try {
+            if (runtimeAuthToken) sessionStorage.setItem(runtimeAuthTokenStorageKey, runtimeAuthToken);
+            else sessionStorage.removeItem(runtimeAuthTokenStorageKey);
+          } catch {
+            // 隐私模式可能禁用 sessionStorage；内存 token 仍覆盖当前文档生命周期。
+          }
         }
 
         function clearToken() {
           runtimeAuthToken = "";
           window.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
+          try {
+            sessionStorage.removeItem(runtimeAuthTokenStorageKey);
+          } catch {}
         }
 
         function shouldForceLogin() {
@@ -1185,7 +1205,7 @@
             throw loginError;
           }
           clearForceLogin();
-          if (body.token) storeToken(body.token);
+          storeToken(body.token);
         }
 
         form.addEventListener("submit", async (event) => {
@@ -1301,10 +1321,13 @@
             }
             clearForceLogin();
             if (state.authenticated || state.authRequired === false) {
+              if (state.authRequired === false) clearToken();
               await gatewayPluginSwitches?.sync();
               await bootRenderer();
               return;
             }
+            // gateway 明确拒绝当前候选凭证后立即清理，避免旧 token 继续覆盖后续登录或 cookie 续期。
+            clearToken();
             showLogin("");
           } catch (error) {
             root.innerHTML =

@@ -24,6 +24,7 @@
     );
   }
   const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE, "zh-CN", "zh", "en-US", "en"];
+  const GATEWAY_AUTH_TOKEN_STORAGE_KEY = "codex_web_auth_token";
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const WS_READY_WAIT_TIMEOUT_MS = 2500;
   const CLIENT_DIAGNOSTIC_FLUSH_DELAY_MS = 120;
@@ -211,12 +212,47 @@
     },
   });
 
-  function gatewayAuthToken() {
+  function normalizeGatewayAuthToken(value) {
+    return String(value || "").trim();
+  }
+
+  function gatewayAuthTokenFromWindow(candidate) {
     try {
-      return String(w.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ || "").trim();
+      return normalizeGatewayAuthToken(candidate && candidate.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__);
     } catch {
       return "";
     }
+  }
+
+  function storedGatewayAuthToken() {
+    try {
+      // sessionStorage 跨同一标签页的刷新和 document replacement 保留；本地内存优先承载最新写入值。
+      return normalizeGatewayAuthToken(sessionStorage.getItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY));
+    } catch {
+      return "";
+    }
+  }
+
+  function gatewayAuthToken() {
+    const localToken = gatewayAuthTokenFromWindow(w);
+    if (localToken) return localToken;
+    const storedToken = storedGatewayAuthToken();
+    if (storedToken) return storedToken;
+    // 同一 origin 的子 frame 可安全读取顶层窗口的交接值；跨 origin 访问会被浏览器拒绝并由 catch 忽略。
+    for (const candidate of [w.parent, w.top, w.opener]) {
+      const inheritedToken = gatewayAuthTokenFromWindow(candidate);
+      if (inheritedToken) return inheritedToken;
+    }
+    return "";
+  }
+
+  function clearGatewayAuthToken() {
+    try {
+      w.__OPEN_CODEX_RUNTIME_AUTH_TOKEN__ = "";
+    } catch {}
+    try {
+      sessionStorage.removeItem(GATEWAY_AUTH_TOKEN_STORAGE_KEY);
+    } catch {}
   }
 
   function gatewayAuthHeaders(headers) {
@@ -1122,6 +1158,7 @@
         headers: gatewayAuthHeaders({ accept: "application/json" }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      clearGatewayAuthToken();
       forceGatewayLoginOnNextBoot();
       w.location.replace("/");
     } catch (error) {
