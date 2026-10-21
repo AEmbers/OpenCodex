@@ -6,6 +6,7 @@
 
 - Prefer the real Statsig initialize response when the network is healthy and fall back locally only for aborts handled by OpenCodex, network failures, timeouts, non-2xx responses, or malformed control-plane payloads.
 - Keep IPC Statsig requests to one terminal response, cancel timed-out native requests, and retry bounded fallback delivery without leaving the first-screen promise unresolved.
+- Treat compatibility points with a safe official fallback as degraded diagnostics instead of marking the running gateway unhealthy.
 - Restore immutable caching for verified Vite and WASM content hashes while keeping fixed-name JavaScript and entry HTML revalidated.
 - Route same-origin refresh and gateway links in the current tab instead of opening a second browser window.
 - Serialize composer draft persistence so delayed acknowledgements cannot restore sent text or overwrite a newer clear.

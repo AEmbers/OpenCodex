@@ -2577,87 +2577,122 @@ function officialBundleStatus() {
     : null;
 }
 
+function summarizeRuntimeCompatibility(snapshot) {
+  // 整点停用与部分贡献停用分别处理，避免一个 disabled 掩盖其他贡献失败。
+  const pointStatuses = [];
+  const abnormalPoints = [];
+  for (const point of snapshot.points) {
+    if (point.explicitlyDisabled) {
+      pointStatuses.push("disabled");
+      continue;
+    }
+    const phases = point.contributions.length
+      ? point.contributions.map((item) => ({
+          contributionId: item.id,
+          location: { status: item.location, reason: item.reason },
+          application: { status: item.application, lastError: item.reason },
+          verification: { status: item.verification, lastError: item.reason },
+          activation: { status: item.activation, lastError: item.reason },
+          fallback: { active: item.fallbackActive, reason: item.fallbackReason },
+          exercise: { status: item.exercise },
+        }))
+      : [point];
+    const issues = [];
+    let pending = false;
+    let enabledCount = 0;
+    let unavailable = false;
+    let degraded = false;
+    let exercised = true;
+    for (const phase of phases) {
+      if (phase.application.status === "disabled") continue;
+      enabledCount += 1;
+      exercised = exercised && phase.exercise.status === "active";
+      const issueStart = issues.length;
+      const add = (type, reason) =>
+        issues.push({
+          type,
+          reason,
+          ...(phase.contributionId ? { contributionId: phase.contributionId } : {}),
+        });
+      if (phase.location.status === "unsupported") add("unsupported", phase.location.reason);
+      if (["ambiguous", "failed", "stale"].includes(phase.location.status)) {
+        add("location", phase.location.reason);
+      }
+      if (phase.application.status === "failed") add("application", phase.application.lastError);
+      if (phase.verification.status === "failed") add("verification", phase.verification.lastError);
+      if (phase.activation.status === "failed") add("activation", phase.activation.lastError);
+      if (phase.fallback.active && issues.length === issueStart) {
+        add("fallback", phase.fallback.reason);
+      }
+      degraded = degraded || phase.fallback.active;
+      unavailable = unavailable || (issues.length > issueStart && !phase.fallback.active);
+      // 待检查按修改点去重，只统计仍启用且没有明确失败的贡献。
+      if (
+        issues.length === issueStart &&
+        (["unresolved", "resolving"].includes(phase.location.status) ||
+          ["pending", "applying"].includes(phase.application.status) ||
+          phase.verification.status === "pending" ||
+          (phase.contributionId &&
+            ["inactive", "activating", "disposed"].includes(phase.activation.status)))
+      ) {
+        pending = true;
+      }
+    }
+    // 每个修改点只归入一种状态；无备用实现的失败优先于降级和待检查。
+    const pointStatus = !enabledCount
+      ? "disabled"
+      : unavailable
+        ? "unavailable"
+        : degraded
+          ? "degraded"
+          : pending
+            ? "pending"
+            : exercised
+              ? "healthy"
+              : "ready";
+    pointStatuses.push(pointStatus);
+    // 降级已有官方 fallback，不影响核心可用性；健康摘要只列出真正不可用且无备用实现的问题。
+    if (pointStatus === "unavailable" && issues.length > 0) {
+      abnormalPoints.push({ id: point.id, description: point.description, issues });
+    }
+  }
+  const countStatus = (status) => pointStatuses.filter((value) => value === status).length;
+  const unavailableCount = countStatus("unavailable");
+  const degradedCount = countStatus("degraded");
+  const pendingCount = countStatus("pending");
+  // 主动禁用和待浏览器上报都不降低已启动网关的健康程度。
+  const status = unavailableCount
+    ? "unavailable"
+    : degradedCount
+      ? "degraded"
+      : pendingCount
+        ? "pending"
+        : countStatus("ready")
+          ? "ready"
+          : pointStatuses.length && countStatus("disabled") === pointStatuses.length
+            ? "disabled"
+            : "healthy";
+  return {
+    status,
+    generatedAt: snapshot.generatedAt,
+    pointCount: snapshot.points.length,
+    unavailableCount,
+    degradedCount,
+    pendingCount,
+    abnormalCount: abnormalPoints.length,
+    abnormalPoints,
+    // 只有没有 fallback 的 unavailable 才阻塞整体健康；已知降级继续在 diagnostics 中可见。
+    ok: unavailableCount === 0,
+  };
+}
+
 function buildGatewayStatus() {
   const listenUrl = `http://${HOST}:${PORT}`;
   const localUrl = `http://127.0.0.1:${PORT}`;
   let compatibility = null;
   try {
     const snapshot = runtimeCompatibility?.snapshot?.();
-    if (snapshot) {
-      // 整点停用与部分贡献停用分别处理，避免一个 disabled 掩盖其他贡献失败。
-      const pointStatuses = [];
-      const abnormalPoints = snapshot.points.flatMap((point) => {
-        if (point.explicitlyDisabled) {
-          pointStatuses.push("disabled");
-          return [];
-        }
-        const phases = point.contributions.length
-          ? point.contributions.map((item) => ({
-              contributionId: item.id,
-              location: { status: item.location, reason: item.reason },
-              application: { status: item.application, lastError: item.reason },
-              verification: { status: item.verification, lastError: item.reason },
-              activation: { status: item.activation, lastError: item.reason },
-              fallback: { active: item.fallbackActive, reason: item.fallbackReason },
-              exercise: { status: item.exercise },
-            }))
-          : [point];
-        const issues = [];
-        let pending = false;
-        let enabledCount = 0;
-        let unavailable = false;
-        let degraded = false;
-        let exercised = true;
-        for (const phase of phases) {
-          if (phase.application.status === "disabled") continue;
-          enabledCount += 1;
-          exercised = exercised && phase.exercise.status === "active";
-          const issueStart = issues.length;
-          const add = (type, reason) => issues.push({ type, reason, ...(phase.contributionId ? { contributionId: phase.contributionId } : {}) });
-          if (phase.location.status === "unsupported") add("unsupported", phase.location.reason);
-          if (["ambiguous", "failed", "stale"].includes(phase.location.status)) add("location", phase.location.reason);
-          if (phase.application.status === "failed") add("application", phase.application.lastError);
-          if (phase.verification.status === "failed") add("verification", phase.verification.lastError);
-          if (phase.activation.status === "failed") add("activation", phase.activation.lastError);
-          if (phase.fallback.active && issues.length === issueStart) add("fallback", phase.fallback.reason);
-          degraded = degraded || phase.fallback.active;
-          unavailable = unavailable || (issues.length > issueStart && !phase.fallback.active);
-          // 待检查按修改点去重，只统计仍启用且没有明确失败的贡献。
-          if (issues.length === issueStart && (
-            ["unresolved", "resolving"].includes(phase.location.status) ||
-            ["pending", "applying"].includes(phase.application.status) ||
-            phase.verification.status === "pending" ||
-            (phase.contributionId && ["inactive", "activating", "disposed"].includes(phase.activation.status))
-          )) pending = true;
-        }
-        // 每个修改点只归入一种状态；无备用实现的失败优先于降级和待检查。
-        pointStatuses.push(!enabledCount ? "disabled" : unavailable ? "unavailable" : degraded ? "degraded" : pending ? "pending" : exercised ? "healthy" : "ready");
-        return issues.length ? [{ id: point.id, description: point.description, issues }] : [];
-      });
-      const countStatus = (status) => pointStatuses.filter((value) => value === status).length;
-      const unavailableCount = countStatus("unavailable");
-      const degradedCount = countStatus("degraded");
-      const pendingCount = countStatus("pending");
-      // 主动禁用不降低健康程度；总体状态和数量使用同一份贡献检查结果。
-      const status = unavailableCount ? "unavailable"
-        : degradedCount ? "degraded"
-        : pendingCount ? "pending"
-        : countStatus("ready") ? "ready"
-        : pointStatuses.length && countStatus("disabled") === pointStatuses.length ? "disabled"
-        : "healthy";
-      compatibility = {
-        status,
-        generatedAt: snapshot.generatedAt,
-        pointCount: snapshot.points.length,
-        unavailableCount,
-        degradedCount,
-        pendingCount,
-        abnormalCount: abnormalPoints.length,
-        abnormalPoints,
-        // 浏览器认证前尚未上报属于待检查，保留状态与数量，但仅明确异常影响健康结果。
-        ok: abnormalPoints.length === 0,
-      };
-    }
+    if (snapshot) compatibility = summarizeRuntimeCompatibility(snapshot);
   } catch {
     // 诊断汇总失败不能让 Launcher 探活接口失效。
   }
@@ -2903,6 +2938,7 @@ module.exports = {
     deliverOfficialAppHostMessage,
     fileManagerPathFromSpawn,
     normalizeInitialSidebarBootstrap,
+    summarizeRuntimeCompatibility,
     OfficialChunkedMessageReceiver,
     officialDesktopIpcSocketPaths,
     outgoingWsEnvelope,

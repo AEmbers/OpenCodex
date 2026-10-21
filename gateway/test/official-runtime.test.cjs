@@ -95,6 +95,77 @@ function createStatsigNetHarness(t, options = {}) {
   return { calls, hookedNet: hook.net, intercepted, nativeNet };
 }
 
+test("gateway health treats safe compatibility fallbacks as non-blocking", () => {
+  const point = (overrides = {}) => ({
+    id: "fixture-point",
+    description: "fixture",
+    explicitlyDisabled: false,
+    contributions: [
+      {
+        id: "fixture-point::0.0",
+        location: "located",
+        reason: "",
+        application: "applied",
+        verification: "verified",
+        activation: "active",
+        fallbackActive: false,
+        fallbackReason: "",
+        exercise: "active",
+        ...overrides,
+      },
+    ],
+  });
+
+  const degraded = __test.summarizeRuntimeCompatibility({
+    generatedAt: "2026-10-21T00:00:00.000Z",
+    points: [
+      point({
+        location: "unsupported",
+        reason: "Official bundle layout changed",
+        fallbackActive: true,
+        fallbackReason: "Official runtime behavior",
+      }),
+    ],
+  });
+  assert.equal(degraded.status, "degraded");
+  assert.equal(degraded.degradedCount, 1);
+  assert.equal(degraded.unavailableCount, 0);
+  assert.equal(degraded.abnormalCount, 0);
+  assert.equal(degraded.ok, true);
+
+  const pending = __test.summarizeRuntimeCompatibility({
+    generatedAt: "2026-10-21T00:00:00.000Z",
+    points: [
+      point({
+        location: "unresolved",
+        application: "pending",
+        verification: "pending",
+        activation: "inactive",
+        exercise: "inactive",
+      }),
+    ],
+  });
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.pendingCount, 1);
+  assert.equal(pending.abnormalCount, 0);
+  assert.equal(pending.ok, true);
+
+  const unavailable = __test.summarizeRuntimeCompatibility({
+    generatedAt: "2026-10-21T00:00:00.000Z",
+    points: [
+      point({
+        location: "unsupported",
+        reason: "No compatible fallback",
+      }),
+    ],
+  });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.unavailableCount, 1);
+  assert.equal(unavailable.abnormalCount, 1);
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.abnormalPoints[0].issues[0].type, "unsupported");
+});
+
 test("Statsig net.fetch preserves the real initialize response and exact telemetry shortcuts", async (t) => {
   const remoteResponse = new Response('{"has_updates":true,"remote":true}', { status: 200 });
   const { calls, hookedNet, intercepted } = createStatsigNetHarness(t, {
