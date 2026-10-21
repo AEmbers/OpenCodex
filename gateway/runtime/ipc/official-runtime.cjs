@@ -483,6 +483,39 @@ function isHiddenOfficialAppServerArgs(args) {
   return Array.isArray(args) && args.some((argument) => argument === "app-server");
 }
 
+function hiddenMcpStartupTimeoutSeconds() {
+  const configured = Number(process.env.OPENCODEX_MCP_STARTUP_TIMEOUT_SEC || 5);
+  if (!Number.isFinite(configured)) return 5;
+  return Math.min(120, Math.max(1, Math.trunc(configured)));
+}
+
+function hasHiddenAppServerConfig(args, key) {
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if ((args[index] === "-c" || args[index] === "--config") && String(args[index + 1]).startsWith(`${key}=`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function withHiddenAppServerMcpStartupBudget(args) {
+  /**
+   * 官方内置 REPL MCP 默认最长等待 120 秒，首屏状态聚合会被单个慢服务拖住。
+   * 只对 OpenCodex 启动的隐藏 app-server 收紧启动预算；用户显式配置过的值保持原样。
+   */
+  const result = Array.isArray(args) ? [...args] : [];
+  const appServerIndex = result.indexOf("app-server");
+  if (appServerIndex < 0) return result;
+  const timeoutSeconds = hiddenMcpStartupTimeoutSeconds();
+  const additions = [];
+  for (const serverName of ["node_repl", "cua_repl"]) {
+    const key = `mcp_servers.${serverName}.startup_timeout_sec`;
+    if (!hasHiddenAppServerConfig(result, key)) additions.push("-c", `${key}=${timeoutSeconds}`);
+  }
+  if (additions.length > 0) result.splice(appServerIndex, 0, ...additions);
+  return result;
+}
+
 function looksLikeComputerUseInstaller(command) {
   if (typeof command !== "string" || !command) return false;
   const normalized = command.replace(/\\/g, "/");
@@ -551,8 +584,9 @@ function redirectHiddenAppServerSpawn(originalSpawn, bundle, self, command, args
   const spawnOptions = spawnOptionsFromArgs(args, options);
   const normalizedArgs = spawnArgList(args);
   if (looksLikeOfficialCodexBinary(command, bundle, spawnOptions) && isHiddenOfficialAppServerArgs(normalizedArgs)) {
-    recordHiddenAppServerRedirect("spawn", command, normalizedArgs, bundle.codexBinaryPath);
-    return decorateHiddenAppServerChild(originalSpawn.call(self, bundle.codexBinaryPath, normalizedArgs, spawnOptions));
+    const optimizedArgs = withHiddenAppServerMcpStartupBudget(normalizedArgs);
+    recordHiddenAppServerRedirect("spawn", command, optimizedArgs, bundle.codexBinaryPath);
+    return decorateHiddenAppServerChild(originalSpawn.call(self, bundle.codexBinaryPath, optimizedArgs, spawnOptions));
   }
   const fileManagerPath = fileManagerPathFromSpawn(command, normalizedArgs);
   if (fileManagerPath && maybeInterceptRemoteFileManagerOpen(fileManagerPath)) {
@@ -566,9 +600,10 @@ function redirectHiddenAppServerExecFile(originalExecFile, bundle, self, command
   const normalizedArgs = spawnArgList(args);
   if (looksLikeOfficialCodexBinary(command, bundle, execOptions) && isHiddenOfficialAppServerArgs(normalizedArgs)) {
     const execCallback = execFileCallbackFromArgs(args, options, callback);
-    recordHiddenAppServerRedirect("execFile", command, normalizedArgs, bundle.codexBinaryPath);
+    const optimizedArgs = withHiddenAppServerMcpStartupBudget(normalizedArgs);
+    recordHiddenAppServerRedirect("execFile", command, optimizedArgs, bundle.codexBinaryPath);
     return decorateHiddenAppServerChild(
-      originalExecFile.call(self, bundle.codexBinaryPath, normalizedArgs, execOptions, execCallback)
+      originalExecFile.call(self, bundle.codexBinaryPath, optimizedArgs, execOptions, execCallback)
     );
   }
   if (looksLikeComputerUseInstaller(command)) {
@@ -2768,6 +2803,7 @@ module.exports = {
     registerAppHostSession,
     releaseAppHostSession,
     isHiddenOfficialAppServerArgs,
+    withHiddenAppServerMcpStartupBudget,
     shouldBridgeOfficialWebContents,
     shouldInterceptRemoteFileManagerStore,
     storeBoundedRequestRoute,

@@ -232,6 +232,32 @@ test("raises only a bounded listener budget for the hidden official renderer", (
   assert.equal(__test.configureOfficialWebContentsListenerBudget({}), false);
 });
 
+test("hidden app-server receives a bounded MCP startup budget", () => {
+  const args = ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"];
+  assert.deepEqual(__test.withHiddenAppServerMcpStartupBudget(args), [
+    "-c",
+    "features.code_mode_host=true",
+    "-c",
+    "mcp_servers.node_repl.startup_timeout_sec=5",
+    "-c",
+    "mcp_servers.cua_repl.startup_timeout_sec=5",
+    "app-server",
+    "--analytics-default-enabled",
+  ]);
+  assert.deepEqual(args, ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"]);
+});
+
+test("hidden app-server preserves explicit MCP startup timeouts", () => {
+  const args = [
+    "-c",
+    "mcp_servers.node_repl.startup_timeout_sec=30",
+    "--config",
+    "mcp_servers.cua_repl.startup_timeout_sec=12",
+    "app-server",
+  ];
+  assert.deepEqual(__test.withHiddenAppServerMcpStartupBudget(args), args);
+});
+
 test("bounds stalled official IPC routes and refreshes their LRU order", () => {
   const routes = new Map();
   const summaries = new Map();
