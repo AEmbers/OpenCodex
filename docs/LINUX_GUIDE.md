@@ -110,7 +110,8 @@ launcher 与 dev runner 会在官方隐藏运行时之外追加以下参数。
 | `--headless` | 让窗口不依赖真实显示服务，配合 Xvfb 使用 |
 | `--disable-gpu` | 无 GPU 的服务器上 GPU 进程会 FATAL 并让 gateway 收到 SIGTRAP 退出 |
 
-若 `/dev/shm` 过小（容器默认 64MB），可再额外设置 `--disable-dev-shm-usage`。
+若 `/dev/shm` 过小（容器默认 64MB），应扩大容器共享内存挂载；当前开关只追加上表中的三个参数，
+不会接受任意额外的 Electron 参数。
 
 判据：设置该变量后 `systemctl show -p Environment` 或进程 cmdline 中应能看到上述三个参数；
 不设置时行为与桌面端完全一致（参数列表为空）。
@@ -122,6 +123,7 @@ export DISPLAY=:99
 export CODEX_DESKTOP_APP_PATH=/tmp/codex-desktop-linux/codex-app
 export CODEX_DESKTOP_EXECUTABLE_PATH=/tmp/codex-desktop-linux/codex-app/electron
 export CODEX_CLI_PATH=/opt/codex-cli/codex
+export OPENCODEX_HEADLESS_ELECTRON=1
 
 cd /path/to/OpenCodex
 pnpm install
