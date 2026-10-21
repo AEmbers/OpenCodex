@@ -65,6 +65,73 @@ function sourceSection(source, startMarker, endMarker) {
   return normalizedSource.slice(start, end);
 }
 
+function createComposerDraftHarness() {
+  return vm.runInNewContext(
+    `(() => {
+      const persistedAtomSnapshot = new Map();
+      const PERSISTED_ATOM_SNAPSHOT_MAX_ENTRIES = 512;
+      const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set();
+      const writes = [];
+      function normalizePersistedAtomValue(_key, value) { return value; }
+      function trimSnapshotMap() {}
+      function invoke(_channel, payload) {
+        let resolve;
+        let reject;
+        const promise = new Promise((resolvePromise, rejectPromise) => {
+          resolve = resolvePromise;
+          reject = rejectPromise;
+        });
+        writes.push({ payload, reject, resolve });
+        return promise;
+      }
+      ${sourceSection(BRIDGE_SOURCE, "  function isPlainObject", "\n\n  /** shared-object snapshot")}
+      ${sourceSection(BRIDGE_SOURCE, "  const COMPOSER_PROMPT_DRAFTS_KEY", "\n  const PENDING_WORKTREES_KEY")}
+      ${sourceSection(
+        BRIDGE_SOURCE,
+        "  function setPersistedAtomSnapshotValue",
+        "\n\n  function persistedAtomSnapshotObject"
+      )}
+      ${sourceSection(
+        BRIDGE_SOURCE,
+        "  /** 合并官方文本草稿",
+        "\n\n  initializePersistedAtomSnapshot();"
+      )}
+      return {
+        dispose() {
+          composerDraftBridgeDisposed = true;
+          pendingComposerDraftWrites.length = 0;
+        },
+        pending: () => pendingComposerDraftWrites.map((write) => ({
+          payload: write.payload,
+          sent: write.sent,
+        })),
+        reconcile: reconcileComposerDraftUpdate,
+        snapshot: () => Object.fromEntries(persistedAtomSnapshot.entries()),
+        update: forwardComposerDraftUpdate,
+        writes,
+      };
+    })()`
+  );
+}
+
+function composerDraftUpdate(threadId, value) {
+  return {
+    key: "composer-prompt-drafts-v2",
+    recordUpdate: {
+      entries: {
+        [threadId]: value === undefined ? null : { value },
+      },
+      legacyStorageKey: "composer-prompt-drafts",
+      maxEntries: 100,
+    },
+    type: "persisted-atom-update",
+  };
+}
+
+function nextTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 class ListenerTarget {
   constructor() {
     this.listeners = new Map();
@@ -1763,6 +1830,112 @@ test("shared and persisted snapshots are bounded while preserving active keys", 
   snapshots.setPersisted("atom-a");
   snapshots.setPersisted("atom-c");
   assert.deepEqual(Array.from(snapshots.persistedKeys()), ["prompt-history", "composer-mode", "atom-a", "atom-c"]);
+});
+
+test("composer draft reconciliation ignores delayed host snapshots while a write is pending", async () => {
+  const drafts = createComposerDraftHarness();
+  const write = drafts.update(composerDraftUpdate("thread-one", "draft text"));
+  await nextTurn();
+  assert.equal(drafts.writes.length, 1);
+
+  const reconciled = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: {},
+  });
+  assert.equal(reconciled.value["thread-one"], "draft text");
+  assert.equal(reconciled.deleted, false);
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "draft text");
+
+  drafts.writes[0].resolve(true);
+  await write;
+});
+
+test("composer draft queue converges consecutive input on the final value", async () => {
+  const drafts = createComposerDraftHarness();
+  const first = drafts.update(composerDraftUpdate("thread-one", "a"));
+  const second = drafts.update(composerDraftUpdate("thread-one", "ab"));
+  await nextTurn();
+
+  assert.equal(drafts.writes.length, 1, "unsent rapid updates should coalesce");
+  assert.deepEqual(drafts.writes[0].payload.recordUpdate.entries["thread-one"], { value: "ab" });
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "ab");
+
+  drafts.writes[0].resolve(true);
+  await Promise.all([first, second]);
+  const reconciled = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: { "thread-one": "ab" },
+  });
+  assert.deepEqual(reconciled.value, { "thread-one": "ab" });
+  assert.equal(drafts.pending().length, 0);
+});
+
+test("composer draft clear survives an older host acknowledgement", async () => {
+  const drafts = createComposerDraftHarness();
+  const save = drafts.update(composerDraftUpdate("thread-one", "old draft"));
+  await nextTurn();
+  const clear = drafts.update(composerDraftUpdate("thread-one", undefined));
+  await nextTurn();
+
+  const stale = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: { "thread-one": "old draft" },
+  });
+  assert.equal(Object.keys(stale.value).length, 0);
+  assert.equal(stale.deleted, false);
+
+  drafts.writes[0].resolve(true);
+  await save;
+  await nextTurn();
+  drafts.writes[1].resolve(true);
+  await clear;
+
+  const confirmed = drafts.reconcile({
+    deleted: false,
+    key: "composer-prompt-drafts-v2",
+    value: {},
+  });
+  assert.equal(Object.keys(confirmed.value).length, 0);
+  assert.equal(drafts.pending().length, 0);
+  assert.equal(Object.keys(drafts.snapshot()["composer-prompt-drafts-v2"]).length, 0);
+});
+
+test("composer draft page replacement prevents queued writes from reaching the next page", async () => {
+  const drafts = createComposerDraftHarness();
+  const pendingWrite = drafts.update(composerDraftUpdate("thread-one", "page one"));
+  drafts.dispose();
+
+  assert.equal(await pendingWrite, false);
+  await nextTurn();
+  assert.equal(drafts.writes.length, 0);
+  assert.equal(await drafts.update(composerDraftUpdate("thread-one", "page two")), false);
+  assert.equal(drafts.writes.length, 0);
+  assert.equal(drafts.pending().length, 0);
+  assert.match(
+    BRIDGE_SOURCE,
+    /composerDraftBridgeDisposed = true;\s*pendingComposerDraftWrites\.length = 0;/
+  );
+});
+
+test("composer draft queue resumes after a failed write", async () => {
+  const drafts = createComposerDraftHarness();
+  const failed = drafts.update(composerDraftUpdate("thread-one", "first"));
+  await nextTurn();
+  drafts.writes[0].reject(new Error("fixture draft write failed"));
+  await assert.rejects(failed, /fixture draft write failed/);
+  await nextTurn();
+  assert.equal(drafts.pending().length, 0);
+
+  const recovered = drafts.update(composerDraftUpdate("thread-one", "recovered"));
+  await nextTurn();
+  assert.equal(drafts.writes.length, 2);
+  assert.deepEqual(drafts.writes[1].payload.recordUpdate.entries["thread-one"], { value: "recovered" });
+  drafts.writes[1].resolve(true);
+  await recovered;
+  assert.equal(drafts.snapshot()["composer-prompt-drafts-v2"]["thread-one"], "recovered");
 });
 
 test("official shared-object updates remain authoritative for guardian approval", () => {
