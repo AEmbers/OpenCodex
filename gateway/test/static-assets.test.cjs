@@ -2164,3 +2164,23 @@ test("official app-menu icons resolve from the site-root /apps/ prefix", (t) => 
   assert.equal(service.staticFile("/apps/missing.png"), null);
   assert.equal(service.staticFile("/apps/icon.txt"), null);
 });
+
+test("official asset lexical containment rejects sibling and parent escapes", () => {
+  const webviewDir = path.join(os.tmpdir(), "opencodex-static-root");
+  const service = createStaticAssetService({ getOfficialBundle: () => ({ webviewDir }) });
+  assert.equal(
+    service.__test.isLexicallyWithinRoot(
+      path.join(webviewDir, "assets", "index-a092859c3d97.js"),
+      webviewDir
+    ),
+    true
+  );
+  assert.equal(
+    service.__test.isLexicallyWithinRoot(path.join(webviewDir, "..", "escape.js"), webviewDir),
+    false
+  );
+  assert.equal(
+    service.__test.isLexicallyWithinRoot(path.join(`${webviewDir}-sibling`, "escape.js"), webviewDir),
+    false
+  );
+});

@@ -6,6 +6,7 @@
 
 - Restore the shared IPC argument normalizer used by the official-runtime fetch preparse, preventing `fetchMessageFromIpcArgs is not defined` from blocking persisted atom synchronization and leaving the browser on the GPT startup icon.
 - Intercept direct `POST /wham/statsig/bootstrap` fetches in the web shell so the current official renderer can finish its post-login Statsig provider initialization.
+- Resolve Windows AppData package redirection when serving hashed official renderer assets, avoiding 404 loops that leave the startup loader permanently visible.
 
 ## 2.1.2
 

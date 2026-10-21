@@ -1111,7 +1111,21 @@ function createStaticAssetService({
     const candidate = path.normalize(path.join(officialBundle.webviewDir, filePath));
     if (!exists(candidate)) return null;
     // URL path 必须落在官方 webview 根目录内，防止 /official/../../ 读取任意文件。
-    return isWithinRoot(candidate, officialBundle.webviewDir) ? candidate : null;
+    if (isWithinRoot(candidate, officialBundle.webviewDir)) return candidate;
+    /**
+     * Windows 打包版可能把 AppData\Roaming 下的子目录重定向到 AppData\Local\Packages\...\LocalCache。
+     * 此时 candidate 的 realpath 会变化而 root 不一定变化；先经过 exists 校验，再用规范化相对路径兜底，
+     * 既兼容系统重定向，也继续拒绝 ../ 和跨目录路径。
+     */
+    if (process.platform === "win32" && isLexicallyWithinRoot(candidate, officialBundle.webviewDir)) {
+      return candidate;
+    }
+    return null;
+  }
+
+  function isLexicallyWithinRoot(candidate, root) {
+    const relative = path.relative(path.resolve(root), path.resolve(candidate));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   }
 
   function locateOfficialStyleAssetHref(prefix) {
@@ -1848,6 +1862,7 @@ ${pluginGatewayStateBootstrapScript()}
     serveRuntimeBootstrap,
     serveWebShellIndex,
     staticFile,
+    __test: { isLexicallyWithinRoot },
   };
 }
 
