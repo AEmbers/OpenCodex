@@ -35,6 +35,22 @@ function isElectronAsarIntegrityEntry(entry) {
   return String(entry.type).toUpperCase() === "INTEGRITY" && String(entry.id).toUpperCase() === "ELECTRONASAR";
 }
 
+function stripWindowsSxSNumericDependencies(manifestText) {
+  /**
+   * MSIX 里的 Chromium 主程序会把内部 chrome_elf 版本声明成 side-by-side 程序集。
+   * 复制到用户目录后该程序集不再由包清单注册，Windows 会把 exe 判为并行配置错误。
+   * chrome_elf.dll 仍被 exe 直接导入，因此只移除无 publicKeyToken 的纯数字程序集依赖。
+   */
+  return String(manifestText || "").replace(/<dependency\b[^>]*>[\s\S]*?<\/dependency>/gi, (dependency) => {
+    const identity = dependency.match(/<assemblyIdentity\b[^>]*\bname\s*=\s*(["'])(.*?)\1[^>]*>/i);
+    if (!identity) return dependency;
+    const assemblyName = identity[2].trim();
+    const isNumericAssembly = /^\d+(?:\.\d+)+$/.test(assemblyName);
+    const hasPublisherToken = /\bpublicKeyToken\s*=/i.test(dependency);
+    return isNumericAssembly && !hasPublisherToken ? "" : dependency;
+  });
+}
+
 function patchWindowsRunnerAsarIntegrity({ runnerRootDir, runnerExecutablePath, sourceExecutablePath, runnerAsarPath, logger }) {
   if (process.platform !== "win32") return;
   assertWindowsRunnerPatchTarget({ runnerRootDir, runnerExecutablePath, sourceExecutablePath });
@@ -63,6 +79,17 @@ function patchWindowsRunnerAsarIntegrity({ runnerRootDir, runnerExecutablePath, 
    */
   resources.entries = resources.entries.filter((entry) => !isElectronAsarIntegrityEntry(entry));
   resources.replaceResourceEntryFromString("INTEGRITY", "ELECTRONASAR", lang, resourceValue);
+
+  // 修复 Windows MSIX 复制件对 Chromium 私有 SxS 程序集的错误依赖，避免 spawn UNKNOWN / 并行配置错误。
+  let sxSManifestPatched = false;
+  for (const entry of resources.entries.filter((item) => Number(item.type) === 24 && Number(item.id) === 1)) {
+    const manifestText = Buffer.from(entry.bin).toString("utf8");
+    const repairedManifest = stripWindowsSxSNumericDependencies(manifestText);
+    if (repairedManifest === manifestText) continue;
+    resources.replaceResourceEntryFromString(24, 1, entry.lang, repairedManifest);
+    sxSManifestPatched = true;
+  }
+
   resources.outputResource(exe);
   fs.writeFileSync(runnerExecutablePath, Buffer.from(exe.generate()));
   logJsonLine(logger, "patched Windows ElectronAsar integrity:", {
@@ -70,9 +97,11 @@ function patchWindowsRunnerAsarIntegrity({ runnerRootDir, runnerExecutablePath, 
     asarPath: runnerAsarPath,
     headerSha256: headerHash,
     lang,
+    sxSManifestPatched,
   });
 }
 
 module.exports = {
   patchWindowsRunnerAsarIntegrity,
+  stripWindowsSxSNumericDependencies,
 };
