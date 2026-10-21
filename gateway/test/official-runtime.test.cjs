@@ -19,96 +19,299 @@ const {
 } = require("../runtime/ipc/official-runtime.cjs");
 const { __test: portableRunnerTest } = require("../runner/platform/portable.cjs");
 const {
-  __test: statsigNetTest,
   installOfficialNetFetchStatsigHook,
 } = require("../runtime/electron/official-net-fetch-statsig-hook.cjs");
+const {
+  createStatsigIpcFallbackCoordinator,
+  resolveStatsigNetworkPolicy,
+} = require("../runtime/electron/statsig-network-resilience.cjs");
 
-test("Statsig net.fetch hook answers control-plane URLs locally and passes others through", () => {
-  const { statsigLocalResponseBodyForUrl, buildStatsigInitializeNetResponse } = statsigNetTest;
-
-  // 初始化必须回合法 gate 配置，且保留官方"新工作树"能力门 505458。
-  const initializeBody = statsigLocalResponseBodyForUrl(
-    "https://ab.chatgpt.com/v1/initialize?k=client-x&st=javascript-client"
-  );
-  assert.ok(initializeBody);
-  const initialize = JSON.parse(initializeBody);
-  assert.equal(initialize.has_updates, true);
-  assert.equal(initialize.feature_gates["505458"].value, true);
-  assert.equal(
-    initialize.dynamic_configs.statsig_default_enable_features.value["505458"],
-    true
-  );
-  assert.equal(initialize.layer_configs["72216192"].value.enable_i18n, true);
-  assert.deepEqual(buildStatsigInitializeNetResponse().sdk_flags, {});
-
-  // SDK 异常上报与 chatgpt.com 遥测吞成空对象；其余 URL 一律透传（空串）。
-  assert.equal(statsigLocalResponseBodyForUrl("https://ab.chatgpt.com/v1/sdk_exception"), "{}");
-  assert.equal(statsigLocalResponseBodyForUrl("https://chatgpt.com/ces/v1/rgstr?k=1"), "{}");
-  assert.equal(statsigLocalResponseBodyForUrl("https://chatgpt.com/ces/v1/log_event"), "{}");
-  assert.equal(statsigLocalResponseBodyForUrl("https://chatgpt.com/backend-api/me"), "");
-  assert.equal(statsigLocalResponseBodyForUrl("https://ab.chatgpt.com/v1/other"), "");
-  assert.equal(statsigLocalResponseBodyForUrl("not a url"), "");
-
-  // 覆写后的 net.fetch 命中 Statsig 地址时返回 200 Response，其它地址透传原生实现。
-  const passthrough = [];
-  const nativeNet = {
-    fetch: async (...args) => {
-      passthrough.push(args);
-      return { ok: true, status: 201 };
+function createFakeStatsigClock() {
+  let current = 0;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => current,
+    setTimer(callback, delay) {
+      const id = nextId++;
+      timers.set(id, { callback, dueAt: current + Math.max(0, Number(delay) || 0) });
+      return id;
     },
+    clearTimer(id) {
+      timers.delete(id);
+    },
+    advance(ms) {
+      const target = current + Math.max(0, ms);
+      while (true) {
+        let next = null;
+        for (const [id, timer] of timers) {
+          if (timer.dueAt <= target && (!next || timer.dueAt < next.timer.dueAt)) {
+            next = { id, timer };
+          }
+        }
+        if (!next) break;
+        timers.delete(next.id);
+        current = next.timer.dueAt;
+        next.timer.callback();
+      }
+      current = target;
+    },
+  };
+}
+
+function createStatsigNetHarness(t, options = {}) {
+  const calls = [];
+  const intercepted = [];
+  const nativeNet = {
+    fetch: options.fetch || (async (...args) => {
+      calls.push(args);
+      return { ok: true, status: 201, source: "native" };
+    }),
     request() {},
   };
-  const electronModule = { net: nativeNet };
-  const intercepted = [];
-  const overrides = [];
-  const hook = installOfficialNetFetchStatsigHook(electronModule, {
-    initializeDelayMs: 0,
-    onIntercept: (url) => intercepted.push(url),
-    registerElectronOverride: (moduleValue, exportName, exportValue) => {
-      overrides.push({ moduleValue, exportName, exportValue });
+  const hook = installOfficialNetFetchStatsigHook(
+    { net: nativeNet },
+    {
+      initializeDelayMs: 100,
+      initializeTimeoutMs: 140,
+      registerElectronOverride() {},
+      onIntercept: (url, details) => intercepted.push({ url, ...details }),
+      ...options,
+    }
+  );
+  t.after(() => {
+    if (typeof options.dispose === "function") options.dispose();
+  });
+  return { calls, hookedNet: hook.net, intercepted, nativeNet };
+}
+
+test("Statsig net.fetch preserves the real initialize response and exact telemetry shortcuts", async (t) => {
+  const remoteResponse = new Response('{"has_updates":true,"remote":true}', { status: 200 });
+  const { calls, hookedNet, intercepted } = createStatsigNetHarness(t, {
+    fetch: async (...args) => {
+      calls.push(args);
+      return remoteResponse;
     },
   });
-  assert.equal(hook.installed, true);
-  const hookedNet = hook.net;
-  assert.equal(overrides.length, 1);
-  assert.equal(overrides[0].moduleValue, electronModule);
-  assert.equal(overrides[0].exportName, "net");
-  assert.equal(overrides[0].exportValue, hookedNet);
 
-  const served = hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
-  assert.ok(served instanceof Promise);
-  return served.then(async (res) => {
-    assert.equal(res.status, 200);
-    const payload = JSON.parse(await res.text());
-    assert.equal(payload.feature_gates["505458"].value, true);
-    assert.equal(intercepted.length, 1);
+  const initialize = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  assert.equal(initialize, remoteResponse);
+  assert.equal(calls.length, 1);
+  assert.equal(intercepted.length, 0, "real network responses must not be reported as local fallback");
 
-    const other = await hookedNet.fetch("https://chatgpt.com/backend-api/me");
-    assert.equal(other.status, 201);
-    assert.equal(passthrough.length, 1);
-  });
+  const telemetry = await hookedNet.fetch("https://chatgpt.com/ces/v1/rgstr?k=1");
+  assert.equal(await telemetry.text(), "{}");
+  const sdkException = await hookedNet.fetch("https://ab.chatgpt.com/v1/sdk_exception");
+  assert.equal(await sdkException.text(), "{}");
+  assert.equal(calls.length, 1, "only the exact telemetry routes are swallowed");
+
+  const nearMatch = await hookedNet.fetch("https://chatgpt.com/ces/v1/rgstr/extra");
+  assert.equal(nearMatch, remoteResponse);
+  assert.equal(calls.length, 2);
 });
 
-test("Statsig IPC classification only accepts the exact control-plane routes", () => {
-  assert.equal(
-    __test.classifyStatsigControlPlaneFetchUrl("https://ab.chatgpt.com/v1/initialize?k=x"),
-    "initialize"
-  );
-  assert.equal(
-    __test.classifyStatsigControlPlaneFetchUrl("https://ab.chatgpt.com/v1/sdk_exception"),
-    "sdk_exception"
-  );
-  assert.equal(__test.classifyStatsigControlPlaneFetchUrl("https://ab.chatgpt.com/v1/other"), "");
-  assert.equal(
-    __test.classifyStatsigControlPlaneFetchUrl("https://ab.chatgpt.com.example/v1/initialize"),
-    ""
-  );
-  assert.equal(__test.classifyStatsigControlPlaneFetchUrl("https://chatgpt.com/v1/initialize"), "");
+test("Statsig net.fetch falls back after network rejection without racing initialization", async (t) => {
+  const startedAt = Date.now();
+  const { calls, hookedNet, intercepted } = createStatsigNetHarness(t, {
+    fetch: async (...args) => {
+      calls.push(args);
+      throw new Error("ECONNREFUSED");
+    },
+  });
 
-  const response = __test.buildStatsigInitializeGatewayResponse();
-  assert.equal(response.has_updates, true);
-  assert.equal(response.feature_gates["505458"].value, true);
-  assert.equal(response.dynamic_configs.statsig_default_enable_features.value["505458"], true);
+  const response = await hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  const elapsedMs = Date.now() - startedAt;
+  const payload = JSON.parse(await response.text());
+  assert.equal(payload.feature_gates["505458"].value, true);
+  assert.ok(elapsedMs >= 90, `fallback returned too early: ${elapsedMs}ms`);
+  assert.equal(calls.length, 1);
+  assert.equal(intercepted.length, 1);
+  assert.equal(intercepted[0].reason, "network_error");
+});
+
+test("Statsig net.fetch bounds hangs and honors explicit offline fallback", async (t) => {
+  const timedStartedAt = Date.now();
+  const timed = createStatsigNetHarness(t, {
+    fetch: () => new Promise(() => {}),
+  });
+  const timedResponse = await timed.hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  assert.equal(timedResponse.status, 200);
+  assert.ok(Date.now() - timedStartedAt >= 130);
+  assert.equal(timed.intercepted.at(-1).reason, "timeout");
+
+  const offlineStartedAt = Date.now();
+  const offline = createStatsigNetHarness(t, {
+    offlineFallback: true,
+    fetch: () => {
+      throw new Error("offline mode must not call native fetch");
+    },
+  });
+  const offlineResponse = await offline.hookedNet.fetch("https://ab.chatgpt.com/v1/initialize?k=x");
+  assert.equal(JSON.parse(await offlineResponse.text()).has_updates, true);
+  assert.ok(Date.now() - offlineStartedAt >= 90);
+  assert.equal(offline.calls.length, 0);
+  assert.equal(offline.intercepted[0].reason, "offline");
+});
+
+test("Statsig timing policy rejects invalid values and caps oversized environment values", () => {
+  const safe = resolveStatsigNetworkPolicy({
+    OPENCODEX_STATSIG_INITIALIZE_DELAY_MS: "invalid",
+    OPENCODEX_STATSIG_INITIALIZE_TIMEOUT_MS: "",
+  });
+  assert.equal(safe.initializeDelayMs, 400);
+  assert.equal(safe.initializeTimeoutMs, 2_500);
+  assert.equal(safe.offlineFallback, false);
+
+  const raceSafe = resolveStatsigNetworkPolicy({
+    OPENCODEX_STATSIG_INITIALIZE_DELAY_MS: "0",
+    OPENCODEX_STATSIG_INITIALIZE_TIMEOUT_MS: "-1",
+  });
+  assert.equal(raceSafe.initializeDelayMs, 100);
+  assert.equal(raceSafe.initializeTimeoutMs, 2_500);
+
+  const bounded = resolveStatsigNetworkPolicy({
+    OPENCODEX_STATSIG_INITIALIZE_DELAY_MS: "999999",
+    OPENCODEX_STATSIG_INITIALIZE_TIMEOUT_MS: "999999",
+    OPENCODEX_STATSIG_OFFLINE_FALLBACK: "YES",
+  });
+  assert.equal(bounded.initializeDelayMs, 3_000);
+  assert.equal(bounded.initializeTimeoutMs, 5_000);
+  assert.equal(bounded.offlineFallback, true);
+});
+
+test("Statsig IPC coordinator preserves success and emits bounded fallback protocol", () => {
+  const clock = createFakeStatsigClock();
+  const sent = [];
+  const createCoordinator = (offlineFallback = false) =>
+    createStatsigIpcFallbackCoordinator({
+      policy: {
+        initializeDelayMs: 100,
+        initializeTimeoutMs: 200,
+        offlineFallback,
+      },
+      sendFallback: (response, details) => sent.push({ response, details }),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+  const channel = "message-from-view";
+  const initializeMessage = {
+    type: "fetch",
+    requestId: "request-1",
+    url: "https://ab.chatgpt.com/v1/initialize?k=x",
+  };
+
+  const online = createCoordinator();
+  assert.deepEqual(online.beforeInvoke(channel, channel, [initializeMessage]), {
+    handled: false,
+    kind: "initialize",
+    requestId: "request-1",
+  });
+  assert.deepEqual(
+    online.observeOutgoing(channel, channel, [
+      { type: "fetch-response", requestId: "request-1", responseType: "success", status: 200 },
+    ]),
+    { suppress: false, requestId: "request-1" }
+  );
+  clock.advance(250);
+  assert.equal(sent.length, 0, "a real success response must cancel the synthetic fallback");
+
+  assert.equal(
+    online.beforeInvoke(channel, channel, [
+      { ...initializeMessage, requestId: "request-timeout" },
+    ]).handled,
+    false
+  );
+  clock.advance(199);
+  assert.equal(sent.length, 0);
+  clock.advance(1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].response.type, "fetch-response");
+  assert.equal(sent[0].response.responseType, "success");
+  assert.equal(sent[0].response.requestId, "request-timeout");
+  assert.equal(sent[0].response.status, 200);
+  assert.deepEqual(sent[0].response.headers, {
+    "content-type": "application/json; charset=utf-8",
+  });
+  const fallbackPayload = JSON.parse(sent[0].response.bodyJsonString);
+  assert.equal(fallbackPayload.feature_gates["505458"].value, true);
+  assert.equal(
+    fallbackPayload.dynamic_configs.statsig_default_enable_features.value["505458"],
+    true
+  );
+  assert.equal(sent[0].details.reason, "timeout");
+  assert.deepEqual(
+    online.observeOutgoing(channel, channel, [
+      { type: "fetch-response", requestId: "request-timeout", responseType: "success" },
+    ]),
+    { suppress: true, requestId: "request-timeout" }
+  );
+
+  online.beforeInvoke(channel, channel, [
+    { ...initializeMessage, requestId: "request-network-error" },
+  ]);
+  clock.advance(20);
+  assert.deepEqual(
+    online.observeOutgoing(channel, channel, [
+      { type: "fetch-response", requestId: "request-network-error", responseType: "error" },
+    ]),
+    { suppress: true, requestId: "request-network-error" }
+  );
+  clock.advance(79);
+  assert.equal(sent.length, 1);
+  clock.advance(1);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].details.reason, "network_error");
+
+  const offline = createCoordinator(true);
+  assert.equal(
+    offline.beforeInvoke(channel, channel, [
+      { ...initializeMessage, requestId: "request-offline" },
+    ]).handled,
+    true
+  );
+  clock.advance(99);
+  assert.equal(sent.length, 2);
+  clock.advance(1);
+  assert.equal(sent.length, 3);
+  assert.equal(sent[2].details.reason, "offline");
+});
+
+test("Statsig IPC exact matches swallow telemetry and pass all other fetch routes", () => {
+  const clock = createFakeStatsigClock();
+  const sent = [];
+  const coordinator = createStatsigIpcFallbackCoordinator({
+    policy: { initializeDelayMs: 100, initializeTimeoutMs: 200, offlineFallback: false },
+    sendFallback: (response) => sent.push(response),
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const channel = "message-from-view";
+
+  assert.equal(
+    coordinator.beforeInvoke(channel, channel, [
+      { type: "fetch", requestId: "telemetry", url: "https://chatgpt.com/ces/v1/rgstr" },
+    ]).handled,
+    true
+  );
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].bodyJsonString, "{}");
+  assert.equal(sent[0].requestId, "telemetry");
+
+  for (const url of [
+    "https://chatgpt.com/ces/v1/rgstr/extra",
+    "https://chatgpt.com.example/ces/v1/rgstr",
+    "https://example.com/ces/v1/log_event",
+    "https://ab.chatgpt.com/v1/other",
+  ]) {
+    assert.equal(
+      coordinator.beforeInvoke(channel, channel, [{ type: "fetch", requestId: "pass", url }]).handled,
+      false,
+      url
+    );
+  }
+  assert.equal(sent.length, 1);
 });
 
 function createFakeMessageChannel() {
@@ -529,6 +732,42 @@ test("never broadcasts a targeted official response when its browser is offline"
 
   __test.routeOfficialWebContentsSend("account-updated", [{ type: "account-updated" }]);
   assert.equal(broadcasts.length, 1);
+});
+
+test("Statsig IPC synthetic responses bypass the outbound fallback observer", (t) => {
+  const sends = [];
+  setWsHub({
+    broadcast() {
+      return 0;
+    },
+    sendTo(clientId, payload) {
+      sends.push({ clientId, payload });
+      return true;
+    },
+  });
+  t.after(() => setWsHub(null));
+
+  const delivered = requestContext.run({ clientId: "statsig-client" }, () =>
+    __test.routeOfficialWebContentsSend(
+      "codex_desktop:message-for-view",
+      [
+        {
+          type: "fetch-response",
+          responseType: "success",
+          requestId: "statsig-fallback-request",
+          status: 200,
+          bodyJsonString: "{}",
+        },
+      ],
+      { id: 1, isDestroyed: () => false },
+      "statsig-ipc-fallback"
+    )
+  );
+
+  assert.equal(delivered, true);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].clientId, "statsig-client");
+  assert.equal(sends[0].payload.payload.requestId, "statsig-fallback-request");
 });
 
 test("remote file manager interception condition is target and host based", () => {

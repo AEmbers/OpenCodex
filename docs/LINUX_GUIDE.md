@@ -90,8 +90,13 @@ pgrep -a Xvfb
 | `CODEX_CLI_PATH` | Codex CLI 二进制路径 | `/opt/codex-cli/codex` |
 | `CODEX_HOME` | Codex 配置目录 | `~/.codex` |
 | `OPENCODEX_HEADLESS_ELECTRON` | 设为 `1` 时追加无头服务器所需 Electron 参数 | `1` |
+| `OPENCODEX_STATSIG_OFFLINE_FALLBACK` | 设为 `1` 时让隐藏运行时的 Statsig 初始化直接走本地合成配置 | `1` |
+| `OPENCODEX_STATSIG_INITIALIZE_DELAY_MS` | 合成 Statsig 初始化的防竞态延迟，默认 400，最低 100，最高 3000 | `400` |
+| `OPENCODEX_STATSIG_INITIALIZE_TIMEOUT_MS` | 等待真实 Statsig 初始化的超时，默认 2500，最高 5000 | `2500` |
 
 `DISPLAY` 指向 Xvfb。其余变量让 OpenCodex 知道 Electron 和 Codex CLI 的位置，以及配置文件存放路径。
+默认情况下 Statsig 初始化会优先使用真实网络响应；只有网络拒绝、超时或显式设置
+`OPENCODEX_STATSIG_OFFLINE_FALLBACK=1` 时才使用本地合成配置。
 
 ## 修改 Electron 启动参数
 
