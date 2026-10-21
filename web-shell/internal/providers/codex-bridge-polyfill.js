@@ -3597,7 +3597,17 @@
   subscribe("account/updated", (payload) => notifyAuthStatus(payload));
   subscribe("codex_desktop:system-theme-variant-updated", (value) => {
     if (value === "dark" || value === "light") {
-      document.documentElement.dataset.theme = value;
+      const root = document.documentElement;
+      root.dataset.theme = value;
+      root.classList.toggle("electron-dark", value === "dark");
+      root.classList.toggle("electron-light", value !== "dark");
+      root.style.colorScheme = value;
+      const themeColor = document.getElementById("opencodex-theme-color");
+      if (themeColor) themeColor.content = value === "dark" ? "#171717" : "#ffffff";
+      // 认证入口首屏读取此值以匹配桌面端最近一次主题选择。
+      try {
+        localStorage.setItem("opencodex_theme", value);
+      } catch {}
     }
   });
   subscribe("shared-object-updated", (message) => {

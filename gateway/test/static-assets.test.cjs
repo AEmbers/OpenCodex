@@ -447,6 +447,113 @@ test("web shell manifest requests credentials for protected origins", () => {
   assert.doesNotMatch(html, /<link id="codex-web-window-controls-overlay-styles"/);
 });
 
+test("web shell restores the saved or system theme before first paint", () => {
+  const html = fs.readFileSync(WEB_SHELL_INDEX, "utf-8");
+  const themeColorIndex = html.indexOf('id="opencodex-theme-color"');
+  const scriptStart = html.indexOf("<script>", themeColorIndex);
+  const scriptEnd = html.indexOf("</script>", scriptStart);
+  assert.notEqual(themeColorIndex, -1);
+  assert.notEqual(scriptStart, -1);
+  assert.notEqual(scriptEnd, -1);
+  const source = html.slice(scriptStart + "<script>".length, scriptEnd);
+
+  function runThemeScript(savedTheme, systemDark) {
+    const classes = new Set(["electron-light"]);
+    const htmlElement = {
+      classList: {
+        toggle(name, enabled) {
+          if (enabled) classes.add(name);
+          else classes.delete(name);
+        },
+      },
+      dataset: {},
+      style: {},
+    };
+    const themeColor = { content: "#ffffff" };
+    vm.runInNewContext(source, {
+      document: {
+        documentElement: htmlElement,
+        getElementById: (id) => (id === "opencodex-theme-color" ? themeColor : null),
+      },
+      localStorage: {
+        getItem: (key) => (key === "opencodex_theme" ? savedTheme : null),
+      },
+      window: {
+        matchMedia: () => ({ matches: systemDark }),
+      },
+    });
+    return { classes, htmlElement, themeColor };
+  }
+
+  const savedDark = runThemeScript("dark", false);
+  assert.equal(savedDark.htmlElement.dataset.theme, "dark");
+  assert.equal(savedDark.htmlElement.style.colorScheme, "dark");
+  assert.equal(savedDark.themeColor.content, "#171717");
+  assert.equal(savedDark.classes.has("electron-dark"), true);
+  assert.equal(savedDark.classes.has("electron-light"), false);
+
+  const systemDark = runThemeScript("", true);
+  assert.equal(systemDark.htmlElement.dataset.theme, "dark");
+  assert.equal(systemDark.themeColor.content, "#171717");
+
+  // 显式保存的浅色必须优先于系统暗色，避免用户选择被系统偏好覆盖。
+  const savedLight = runThemeScript("light", true);
+  assert.equal(savedLight.htmlElement.dataset.theme, "light");
+  assert.equal(savedLight.themeColor.content, "#ffffff");
+  assert.equal(savedLight.classes.has("electron-light"), true);
+  assert.match(html, /html\[data-theme="dark"\] \.panel/);
+  assert.match(html, /html\[data-theme="dark"\] #password/);
+});
+
+test("bridge persists desktop theme updates for the authentication entry", () => {
+  const bridge = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
+  const start = bridge.indexOf('subscribe("codex_desktop:system-theme-variant-updated"');
+  const end = bridge.indexOf('subscribe("shared-object-updated"', start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  let handler = null;
+  const stored = [];
+  const classes = new Set();
+  const htmlElement = {
+    classList: {
+      toggle(name, enabled) {
+        if (enabled) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+    dataset: {},
+    style: {},
+  };
+  const themeColor = { content: "#ffffff" };
+  vm.runInNewContext(bridge.slice(start, end), {
+    document: {
+      documentElement: htmlElement,
+      getElementById: (id) => (id === "opencodex-theme-color" ? themeColor : null),
+    },
+    localStorage: {
+      setItem(key, value) {
+        stored.push([key, value]);
+      },
+    },
+    subscribe(channel, callback) {
+      assert.equal(channel, "codex_desktop:system-theme-variant-updated");
+      handler = callback;
+    },
+  });
+
+  assert.equal(typeof handler, "function");
+  handler("dark");
+  assert.equal(htmlElement.dataset.theme, "dark");
+  assert.equal(htmlElement.style.colorScheme, "dark");
+  assert.equal(classes.has("electron-dark"), true);
+  assert.equal(classes.has("electron-light"), false);
+  assert.equal(themeColor.content, "#171717");
+  assert.deepEqual(stored, [["opencodex_theme", "dark"]]);
+  handler("unsupported");
+  assert.equal(htmlElement.dataset.theme, "dark");
+  assert.equal(stored.length, 1);
+});
+
 test("web shell scripts revalidate unchanged content instead of retransferring it", (t) => {
   const service = createService(makeOfficialWebviewDir(t));
   const first = serveOfficialAssetResponse(
