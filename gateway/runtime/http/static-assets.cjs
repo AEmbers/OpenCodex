@@ -253,7 +253,17 @@ function patchOfficialAssetOffMainThread({ data, downloadMessage, host, locale, 
  * 按内容寻址的静态资源类型，避免把入口 HTML 或其它动态文件误判为 immutable。
  */
 const CONTENT_HASHED_ASSET_FILE_RE =
-  /[-.][A-Za-z0-9_-]{8,64}\.(?:avif|css|gif|ico|jpe?g|js|mjs|map|png|svg|wasm|webp|woff2?)$/i;
+  /(?:-([A-Za-z0-9_-]{8,64})\.(?:avif|css|gif|ico|jpe?g|js|mjs|map|png|svg|webp|woff2?)|\.([A-Za-z0-9_]{8,64})\.wasm)$/i;
+
+function isContentHashedAssetFile(relativePath) {
+  const match = CONTENT_HASHED_ASSET_FILE_RE.exec(relativePath);
+  const hash = match?.[1] || match?.[2];
+  // 纯小写自然单词不能仅凭长度冒充 hash；常见 content hash 至少含数字或大小写混合。
+  return Boolean(
+    hash &&
+      (/[0-9]/.test(hash) || (hash !== hash.toLowerCase() && hash !== hash.toUpperCase()))
+  );
+}
 
 // 固定 web-shell 资源只在这里登记一次，白名单和文件映射共用同一份配置。
 const WEB_SHELL_STATIC_FILES = new Map([
@@ -1603,7 +1613,7 @@ ${pluginGatewayStateBootstrapScript()}
        */
       if (
         reqPath.startsWith(PATCHED_OFFICIAL_PREFIX) &&
-        CONTENT_HASHED_ASSET_FILE_RE.test(patchedOfficialAssetName(reqPath))
+        isContentHashedAssetFile(patchedOfficialAssetName(reqPath))
       ) {
         return "public, max-age=31536000, immutable";
       }

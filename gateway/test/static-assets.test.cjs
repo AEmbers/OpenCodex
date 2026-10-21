@@ -1704,6 +1704,9 @@ test("current 12-char content hashes stay immutable and public cache drops cooki
   fs.writeFileSync(path.join(assetsDir, "index-102d07b7ae6c.js"), "export const ready = true;");
   fs.writeFileSync(path.join(assetsDir, "DocumentFormat.OpenXml.4g1x2psnat.wasm"), "wasm");
   fs.writeFileSync(path.join(assetsDir, "dotnet.js"), "export const runtime = true;");
+  fs.writeFileSync(path.join(assetsDir, "config.production.js"), "export const env = 'production';");
+  fs.writeFileSync(path.join(assetsDir, "asset-development.js"), "export const env = 'development';");
+  fs.writeFileSync(path.join(assetsDir, "worker.localhost.js"), "export const worker = true;");
   fs.writeFileSync(path.join(assetsDir, "index-102d07b7ae6c.html"), "<html>entry</html>");
   const service = createService(webviewDir);
 
@@ -1721,6 +1724,14 @@ test("current 12-char content hashes stay immutable and public cache drops cooki
     `${PATCHED_OFFICIAL_PREFIX}assets/index-102d07b7ae6c.html`
   );
   assert.equal(html.headers["cache-control"], "no-store");
+  for (const fixedName of ["config.production.js", "asset-development.js", "worker.localhost.js"]) {
+    const fixed = serveOfficialAssetResponse(
+      service,
+      `${PATCHED_OFFICIAL_PREFIX}assets/${fixedName}`
+    );
+    // 长自然单词不是 content hash，不能因名称长度被浏览器固化缓存一年。
+    assert.equal(fixed.headers["cache-control"], "no-store");
+  }
 
   // 长缓存（public）响应必须剥离 auth gate 预写的 Set-Cookie，否则浏览器无法复用缓存。
   const hashedPath = `${PATCHED_OFFICIAL_PREFIX}assets/index-102d07b7ae6c.js`;

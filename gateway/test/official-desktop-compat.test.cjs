@@ -1040,6 +1040,26 @@ test("runtime optimizer coalesces delegated worktree shell environment reads in 
   assert.equal(service.callCount, 1);
 });
 
+test("runtime optimizer leaves nested delegated worktree arguments untouched", (t) => {
+  const bundleDir = temporaryDirectory(t);
+  const mainPath = path.join(bundleDir, ".vite", "build", "main.js");
+  const source =
+    'var services={"worktree-shell-environment-config":({cwd:e,hostId:t})=>this.readWorktreeShellEnvironment(normalize(e),t)};';
+  writeFile(mainPath, source);
+  const optimizer = new OfficialRuntimeOptimizer({ fileSystem: new OfficialBundleFileSystem() });
+
+  assert.deepEqual(optimizer.optimize(bundleDir), {
+    nativePetComposition: "not-present",
+    nativePetPrewarm: "not-present",
+    macPushRegistration: "not-present",
+    patchedFileCount: 0,
+    unsupportedFiles: ["main.js:worktree-shell-environment"],
+    worktreeShellEnvironment: "unsupported-layout",
+  });
+  // 未知参数布局必须保持原样，宁可少做优化也不能截断表达式后产生合法但错误的参数。
+  assert.equal(fs.readFileSync(mainPath, "utf8"), source);
+});
+
 test("runtime optimizer reports an unsupported Git discovery layout without partial assumptions", (t) => {
   const bundleDir = temporaryDirectory(t);
   const workerPath = path.join(bundleDir, ".vite", "build", "worker-new-layout.js");

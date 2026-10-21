@@ -47,8 +47,15 @@ const GIT_LOCAL_PREFILTER_PATTERN =
 const GIT_BACKGROUND_TIMEOUT_PATTERN =
   /async function (?<functionName>[A-Za-z_$][\w$]*)\((?<cwdName>[A-Za-z_$][\w$]*),(?<argsName>[A-Za-z_$][\w$]*),(?<hostName>[A-Za-z_$][\w$]*),(?<optionsName>[A-Za-z_$][\w$]*)=\{\}\)\{let\{[^}]{0,1400}timeoutMs:(?<timeoutOptionName>[A-Za-z_$][\w$]*)[^}]{0,1400}\}=\k<optionsName>,[^;]{1,2400}?(?<timeoutName>[A-Za-z_$][\w$]*)=Object\.is\(\k<timeoutOptionName>,null\)\?void 0:\k<timeoutOptionName>\?\?\([^;]{1,400}?\),(?<idName>[A-Za-z_$][\w$]*)=crypto\.randomUUID\(\)\.slice\(0,8\),(?<startedName>[A-Za-z_$][\w$]*)=Date\.now\(\),(?<deadlineName>[A-Za-z_$][\w$]*)=\k<timeoutName>==null\?void 0:\k<startedName>\+\k<timeoutName>,(?<contextName>[A-Za-z_$][\w$]*)=(?<contextFactoryName>[A-Za-z_$][\w$]*)\(\),(?<metadataKeyName>[A-Za-z_$][\w$]*)=[^;]{1,1200}?\k<contextName>\.metadataCommonDir[^;]{1,1200}?;[\s\S]{0,18000}?let (?<timerName>[A-Za-z_$][\w$]*)=\k<timeoutName>==null\?null:setTimeout/g;
 // 新版官方 bundle 会把内联 handler 委托给实例方法；两种布局都必须被识别，包装后仍保留箭头函数的词法 this。
-const WORKTREE_SHELL_ENVIRONMENT_PATTERN =
-  /"worktree-shell-environment-config":((?:async\s*)?\(\{[^)]*\}\)\s*=>\s*(?:\{let [^;]{1,1000};return\{shellEnvironment:[^{}]{1,300}\}\}|(?:this\.)?readWorktreeShellEnvironment\([^)]*\)|\{(?:let [^;]{1,1000};)?return\s*(?:this\.)?readWorktreeShellEnvironment\([^)]*\);?\}))/g;
+// 委托参数只接受已确认的两个简单实参，避免把含嵌套调用的未知布局截断后改成语义错误的代码。
+const WORKTREE_SHELL_ENVIRONMENT_DELEGATE_ARGUMENTS =
+  "\\([A-Za-z_$][\\w$]*,[A-Za-z_$][\\w$]*(?:\\?\\?(?:`[^`$\\\\]*`|\"[^\"\\\\]*\"|'[^'\\\\]*'|null))?\\)";
+const WORKTREE_SHELL_ENVIRONMENT_DELEGATE_CALL =
+  `(?:this\\.)?readWorktreeShellEnvironment${WORKTREE_SHELL_ENVIRONMENT_DELEGATE_ARGUMENTS}`;
+const WORKTREE_SHELL_ENVIRONMENT_PATTERN = new RegExp(
+  `"worktree-shell-environment-config":((?:async\\s*)?\\(\\{[^)]*\\}\\)\\s*=>\\s*(?:\\{let [^;]{1,1000};return\\{shellEnvironment:[^{}]{1,300}\\}\\}|${WORKTREE_SHELL_ENVIRONMENT_DELEGATE_CALL}|\\{(?:let [^;]{1,1000};)?return\\s*${WORKTREE_SHELL_ENVIRONMENT_DELEGATE_CALL};?\\}))`,
+  "g"
+);
 
 function matchCount(source: string, pattern: RegExp): number {
   // 所有模式都带全局标记；match 返回完整命中列表，不复用可变 lastIndex。
