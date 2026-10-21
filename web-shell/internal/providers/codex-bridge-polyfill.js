@@ -2015,18 +2015,10 @@
     }
   }
 
-  /** 当前官方版本把登录后 Statsig 初始化改走 /wham IPC；Web 侧沿用已有本地默认配置，避免固定五秒超时。 */
-  function handlePostLoginStatsigBootstrapFetchMessage(payload) {
-    if (!payload || typeof payload !== "object" || payload.type !== "fetch") return false;
-    if (String(payload.method || "GET").toUpperCase() !== "POST" || !isPostLoginStatsigBootstrapUrl(payload.url)) {
-      return false;
-    }
-    const requestId = String(payload.requestId || "");
-    if (!requestId) return false;
-    modificationEffects?.statsig?.emit();
+  function buildPostLoginStatsigBootstrapPayload(rawBody) {
     let request = {};
     try {
-      request = payload.body ? JSON.parse(payload.body) : {};
+      request = rawBody ? JSON.parse(rawBody) : {};
     } catch {}
     const stableId = typeof request.stable_id === "string" ? request.stable_id : "";
     const user = {
@@ -2036,10 +2028,20 @@
         ? { customIDs: { stableID: stableId, source_surface_stable_id: stableId } }
         : {}),
     };
-    emitFetchSuccess(requestId, {
-      // 官方会先 JSON.parse(statsigPayload) 校验 user，再交给 Statsig data adapter；必须保持字符串协议。
-      statsigPayload: JSON.stringify({ ...buildStatsigInitializeResponse(), user }),
-    });
+    // 官方 bootstrap 读取的是 JSON 字符串字段，不能直接把对象写进 statsigPayload。
+    return { statsigPayload: JSON.stringify({ ...buildStatsigInitializeResponse(), user }) };
+  }
+
+  /** 当前官方版本把登录后 Statsig 初始化改走 /wham IPC；Web 侧沿用已有本地默认配置，避免固定五秒超时。 */
+  function handlePostLoginStatsigBootstrapFetchMessage(payload) {
+    if (!payload || typeof payload !== "object" || payload.type !== "fetch") return false;
+    if (String(payload.method || "GET").toUpperCase() !== "POST" || !isPostLoginStatsigBootstrapUrl(payload.url)) {
+      return false;
+    }
+    const requestId = String(payload.requestId || "");
+    if (!requestId) return false;
+    modificationEffects?.statsig?.emit();
+    emitFetchSuccess(requestId, buildPostLoginStatsigBootstrapPayload(payload.body));
     return true;
   }
 
@@ -3899,6 +3901,16 @@
     }
   }
 
+  async function fetchBodyText(input, init) {
+    if (typeof init?.body === "string") return init.body;
+    if (init?.body == null && input && typeof input.clone === "function") {
+      try {
+        return await input.clone().text();
+      } catch {}
+    }
+    return "";
+  }
+
   // sentry-ipc:// 是 Electron 私有协议，浏览器里用空响应兜底，避免 renderer 报错。
   if (typeof w.fetch === "function" && !w.__codexWebFetchPatched) {
     const originalFetch = w.fetch.bind(w);
@@ -3909,10 +3921,20 @@
           : input && typeof input === "object" && "url" in input
             ? String(input.url || "")
             : "";
+      const method = String(
+        init?.method || (input && typeof input === "object" ? input.method : "") || "GET"
+      ).toUpperCase();
       if (url.startsWith("sentry-ipc://")) {
         return new Response("{}", {
           status: 200,
           headers: { "content-type": "application/json" },
+        });
+      }
+      if (method === "POST" && isPostLoginStatsigBootstrapUrl(url)) {
+        const body = await fetchBodyText(input, init);
+        return new Response(JSON.stringify(buildPostLoginStatsigBootstrapPayload(body)), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
         });
       }
       if (isStatsigInitializeUrl(url)) {

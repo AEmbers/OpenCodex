@@ -45,6 +45,7 @@ const {
   buildStatsigInitializeResponse,
   classifyStatsigRequestUrl,
   createStatsigIpcFallbackCoordinator,
+  fetchMessageFromIpcArgs,
   resolveStatsigNetworkPolicy,
 } = require("../electron/statsig-network-resilience.cjs");
 const { createOfficialLiveObserver } = require("./official-live-observer.cjs");
@@ -2956,6 +2957,7 @@ module.exports = {
     threadListInvalidationRequest,
     classifyStatsigRequestUrl,
     buildStatsigInitializeGatewayResponse: buildStatsigInitializeResponse,
+    maybeHandleComputerUseAuthWriteNoop,
     invokeStatsigAwareOperation,
     statsigIpcFallbackCoordinator,
   },

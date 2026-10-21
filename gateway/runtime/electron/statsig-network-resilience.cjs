@@ -717,6 +717,7 @@ module.exports = {
   createStatsigAbortError,
   createStatsigIpcFallbackCoordinator,
   extractAbortSignalFromFetchArgs,
+  fetchMessageFromIpcArgs,
   isConsumableStatsigInitializeFetchResponse,
   isConsumableStatsigInitializeJson,
   parseTruthyEnv,

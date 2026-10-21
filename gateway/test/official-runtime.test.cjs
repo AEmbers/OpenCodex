@@ -25,6 +25,7 @@ const {
   createStatsigIpcFallbackCoordinator,
   resolveStatsigNetworkPolicy,
 } = require("../runtime/electron/statsig-network-resilience.cjs");
+const { MESSAGE_FROM_VIEW_CHANNEL } = require("../runtime/core/config.cjs");
 
 function createFakeStatsigClock() {
   let current = 0;
@@ -164,6 +165,14 @@ test("gateway health treats safe compatibility fallbacks as non-blocking", () =>
   assert.equal(unavailable.abnormalCount, 1);
   assert.equal(unavailable.ok, false);
   assert.equal(unavailable.abnormalPoints[0].issues[0].type, "unsupported");
+});
+
+test("official runtime accepts non-fetch IPC arguments", () => {
+  // persisted-atom sync 等普通 IPC 也必须安全穿过 fetch 前置判断，不能因缺少参数归一化函数卡住首屏。
+  assert.equal(
+    __test.maybeHandleComputerUseAuthWriteNoop(MESSAGE_FROM_VIEW_CHANNEL, []),
+    false
+  );
 });
 
 test("Statsig net.fetch preserves the real initialize response and exact telemetry shortcuts", async (t) => {

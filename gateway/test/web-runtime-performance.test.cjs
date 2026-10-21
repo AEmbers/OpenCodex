@@ -2845,8 +2845,11 @@ test("whole-document observer filters stay scoped to their feature mounts", () =
   assert.match(BRIDGE_SOURCE, /TERMINAL_QUEUE_MAX_SESSIONS/);
   assert.match(BRIDGE_SOURCE, /SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 512/);
   assert.match(BRIDGE_SOURCE, /PERSISTED_ATOM_SNAPSHOT_MAX_ENTRIES = 512/);
+  assert.match(BRIDGE_SOURCE, /function buildPostLoginStatsigBootstrapPayload/);
   assert.match(BRIDGE_SOURCE, /function handlePostLoginStatsigBootstrapFetchMessage/);
   assert.match(BRIDGE_SOURCE, /statsigPayload: JSON\.stringify\(\{ \.\.\.buildStatsigInitializeResponse\(\), user \}\)/);
+  assert.match(BRIDGE_SOURCE, /method === "POST" && isPostLoginStatsigBootstrapUrl\(url\)/);
+  assert.match(BRIDGE_SOURCE, /function fetchBodyText\(input, init\)/);
   assert.match(BRIDGE_SOURCE, /function handleStatsigTelemetryFetchMessage/);
   assert.match(BRIDGE_SOURCE, /if \(handleStatsigTelemetryFetchMessage\(payload\)\)/);
   assert.match(BRIDGE_SOURCE, /target\.getDesktopUserAgent = \(\) => navigator\.userAgent/);
