@@ -895,6 +895,24 @@ test("bridge resolves window focus from the browser instead of the hidden Electr
   assert.match(bridge, /emitWindowMessage\(effectiveChannel, rendererMessagePayload\)/);
 });
 
+test("bridge suppresses only mobile-subscription billing 400 fallback toasts", () => {
+  const bridge = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
+  const declaration = sourceFunctionDeclaration(bridge, "shouldSurfaceFetchIpcError");
+  const shouldSurface = new Function(`${declaration}; return shouldSurfaceFetchIpcError;`)();
+
+  assert.equal(
+    shouldSurface(400, "Payment methods for mobile subscriptions must be managed in the mobile platform."),
+    false
+  );
+  assert.equal(
+    shouldSurface(400, "Mobile subscriptions must be managed in the mobile platform."),
+    false
+  );
+  assert.equal(shouldSurface(400, "Unrelated billing request failed"), true);
+  assert.equal(shouldSurface(500, "unsupported codex ipc channel"), true);
+  assert.equal(shouldSurface(500, "Payment methods for mobile subscriptions"), false);
+});
+
 test("patched official renderer CSP allows the injected PWA manifest", (t) => {
   const webviewDir = makeTempDir(t);
   fs.writeFileSync(
