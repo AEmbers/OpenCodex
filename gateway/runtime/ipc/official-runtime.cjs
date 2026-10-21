@@ -2180,6 +2180,54 @@ async function invokeOfficialIpc(channel, args = [], context = {}) {
   throw new Error(`No official Electron IPC handler for ${channel}`);
 }
 
+// 官方 AppHost 会把清理器挂在共享 WebContents 的 destroyed 事件上。每次连接必须独立
+// 登记这些清理器，并在 relay 关闭时主动执行，不能等一个永不销毁的隐藏窗口。
+const appHostOwnerQueues = new WeakMap();
+
+function snapshotAppHostDestroyListeners(owner) {
+  try {
+    if (!owner || typeof owner.rawListeners !== "function") return null;
+    return new Set(owner.rawListeners("destroyed"));
+  } catch {
+    return null;
+  }
+}
+
+function collectAppHostDestroyListeners(owner, before) {
+  const after = snapshotAppHostDestroyListeners(owner);
+  return before && after ? [...after].filter((listener) => !before.has(listener)) : [];
+}
+
+function runAppHostOwnerExclusive(owner, operation) {
+  // 官方 listener 可能异步完成注册；按 owner 串行化，避免并发连接互相认领清理器。
+  const previous = appHostOwnerQueues.get(owner) || Promise.resolve();
+  const current = previous.then(operation, operation);
+  const settled = current.then(
+    () => undefined,
+    () => undefined,
+  );
+  appHostOwnerQueues.set(owner, settled);
+  return current;
+}
+
+function releaseAppHostSession(session) {
+  if (!session || session.released) return false;
+  session.released = true;
+  const { listeners, owner } = session;
+  // 只执行仍挂在该 owner 上的本次清理器；调用 once 包装器会同时完成移除和 dispose。
+  const current = snapshotAppHostDestroyListeners(owner);
+  for (const listener of Array.isArray(listeners) ? listeners : []) {
+    if (current && !current.has(listener)) continue;
+    try {
+      listener.call(owner);
+    } catch {}
+    try {
+      owner.removeListener("destroyed", listener);
+    } catch {}
+  }
+  return true;
+}
+
 async function connectOfficialAppHostPort(port, context = {}) {
   /**
    * 官方新版 renderer 启动时不再只走 electronBridge.invoke，而是通过 MessageChannel
@@ -2193,11 +2241,31 @@ async function connectOfficialAppHostPort(port, context = {}) {
   }
   // 等价于官方 preload 的 ipcRenderer.postMessage(channel, undefined, [port])。
   const event = createOfficialIpcEvent({ ...context, ports: [port] });
-  for (const listener of [...listeners]) {
-    await listener(event);
-  }
-  recordRuntimeCompatibilityHit(gatewayPointRefs.appHostRelay);
-  return true;
+  return registerAppHostSession(event.sender, async () => {
+    for (const listener of [...listeners]) {
+      await listener(event);
+    }
+    recordRuntimeCompatibilityHit(gatewayPointRefs.appHostRelay);
+  });
+}
+
+function registerAppHostSession(owner, operation) {
+  return runAppHostOwnerExclusive(owner, async () => {
+    const before = snapshotAppHostDestroyListeners(owner);
+    const session = { listeners: [], owner, released: false };
+    try {
+      await operation();
+      // 给官方 0ms/next-tick 级补挂留一个事件循环窗口，再冻结本次连接的所有权边界。
+      await new Promise((resolve) => setImmediate(resolve));
+      session.listeners = collectAppHostDestroyListeners(owner, before);
+      return session;
+    } catch (error) {
+      // listener 可能已经创建了部分 host；失败时也必须执行并移除已挂上的清理器。
+      session.listeners = collectAppHostDestroyListeners(owner, before);
+      releaseAppHostSession(session);
+      throw error;
+    }
+  });
 }
 
 function deliverOfficialAppHostMessage(event, onMessage, close) {
@@ -2217,15 +2285,36 @@ function deliverOfficialAppHostMessage(event, onMessage, close) {
  * 这里不解析 app-host RPC 内容，只保证旧字符串帧、新结构化值和关闭信号按顺序穿过边界。
  */
 function createOfficialAppHostRelay(options = {}) {
-  const { clientId = "", onClose, onError, onMessage, portId = "", remoteAddress = "" } = options;
-  if (typeof electron.MessageChannelMain !== "function") {
-    throw new Error("Electron MessageChannelMain is unavailable");
-  }
+  const {
+    clientId = "",
+    connectPort = connectOfficialAppHostPort,
+    createMessageChannel = null,
+    onClose,
+    onError,
+    onMessage,
+    portId = "",
+    remoteAddress = "",
+  } = options;
+  const messageChannelFactory =
+    createMessageChannel ||
+    (() => {
+      if (typeof electron.MessageChannelMain !== "function") {
+        throw new Error("Electron MessageChannelMain is unavailable");
+      }
+      return new electron.MessageChannelMain();
+    });
 
   // port1 交给官方 IPC listener；port2 留在 gateway，用来和浏览器 WebSocket 互转消息。
-  const { port1, port2 } = new electron.MessageChannelMain();
+  const { port1, port2 } = messageChannelFactory();
   let closed = false;
   let nullCloseScheduled = false;
+  let appHostSession = null;
+
+  function releaseCurrentAppHostSession() {
+    const session = appHostSession;
+    appHostSession = null;
+    releaseAppHostSession(session);
+  }
 
   function close(reason = "closed") {
     if (closed) return;
@@ -2239,6 +2328,8 @@ function createOfficialAppHostRelay(options = {}) {
     try {
       onClose && onClose(reason);
     } catch {}
+    // 关闭、替换和错误路径最终都汇入这里，确保该 relay 不再持有 AppHost 清理器。
+    releaseCurrentAppHostSession();
   }
 
   port2.on("message", (event) => {
@@ -2260,8 +2351,14 @@ function createOfficialAppHostRelay(options = {}) {
   port2.on("close", () => close("official_port_closed"));
   port2.start();
 
-  connectOfficialAppHostPort(port1, { clientId, portId, remoteAddress }).then(
-    () => {
+  connectPort(port1, { clientId, portId, remoteAddress }).then(
+    (session) => {
+      if (closed) {
+        // relay 可能在官方异步登记完成前就被替换或关闭，完成后必须立即回收。
+        releaseAppHostSession(session);
+      } else {
+        appHostSession = session;
+      }
       if (DEBUG_LOGS) {
         // app-host 正常连接只是生命周期事件；失败仍保持常规日志，方便排查终端/侧栏能力不可用。
         diagnosticLog("official-app-host", "connected", {
@@ -2668,6 +2765,8 @@ module.exports = {
     outgoingWsEnvelope,
     routeIdFromValue,
     routeOfficialWebContentsSend,
+    registerAppHostSession,
+    releaseAppHostSession,
     isHiddenOfficialAppServerArgs,
     shouldBridgeOfficialWebContents,
     shouldInterceptRemoteFileManagerStore,

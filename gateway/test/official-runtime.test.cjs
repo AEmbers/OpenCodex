@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -11,11 +12,149 @@ const {
   __test: observerTest,
 } = require("../runtime/ipc/official-live-observer.cjs");
 const {
+  createOfficialAppHostRelay,
   __test,
   requestContext,
   setWsHub,
 } = require("../runtime/ipc/official-runtime.cjs");
 const { __test: portableRunnerTest } = require("../runner/platform/portable.cjs");
+
+function createFakeMessageChannel() {
+  class FakePort extends EventEmitter {
+    constructor() {
+      super();
+      this.closed = false;
+      this.messages = [];
+    }
+
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.emit("close");
+    }
+
+    postMessage(data) {
+      this.messages.push(data);
+    }
+
+    start() {}
+  }
+
+  // 测试 relay 生命周期时使用内存端口，避免依赖真实 Electron 主进程。
+  return { port1: new FakePort(), port2: new FakePort() };
+}
+
+test("attributes concurrent app-host cleanups to one relay at a time", async () => {
+  const owner = new EventEmitter();
+  const disposed = [];
+  owner.on("destroyed", () => disposed.push("baseline"));
+
+  let finishFirst;
+  const firstCanFinish = new Promise((resolve) => {
+    finishFirst = resolve;
+  });
+  let secondStarted = false;
+  const first = __test.registerAppHostSession(owner, async () => {
+    owner.once("destroyed", () => disposed.push("first"));
+    await firstCanFinish;
+  });
+  const second = __test.registerAppHostSession(owner, () => {
+    secondStarted = true;
+    owner.once("destroyed", () => disposed.push("second"));
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondStarted, false);
+  finishFirst();
+  const [firstSession, secondSession] = await Promise.all([first, second]);
+
+  assert.equal(owner.listenerCount("destroyed"), 3);
+  assert.equal(__test.releaseAppHostSession(firstSession), true);
+  assert.deepEqual(disposed, ["first"]);
+  assert.equal(owner.listenerCount("destroyed"), 2);
+
+  assert.equal(__test.releaseAppHostSession(secondSession), true);
+  assert.deepEqual(disposed, ["first", "second"]);
+  assert.equal(owner.listenerCount("destroyed"), 1);
+  assert.equal(__test.releaseAppHostSession(secondSession), false);
+});
+
+test("releases a partially registered app-host session after listener failure", async () => {
+  const owner = new EventEmitter();
+  const disposed = [];
+
+  await assert.rejects(
+    __test.registerAppHostSession(owner, () => {
+      owner.once("destroyed", () => disposed.push("partial"));
+      throw new Error("official listener failed");
+    }),
+    /official listener failed/
+  );
+
+  assert.deepEqual(disposed, ["partial"]);
+  assert.equal(owner.listenerCount("destroyed"), 0);
+});
+
+test("keeps repeated app-host connection cycles within one owner baseline", async () => {
+  const owner = new EventEmitter();
+  let disposed = 0;
+  owner.on("destroyed", () => {});
+
+  for (let index = 0; index < 80; index += 1) {
+    const session = await __test.registerAppHostSession(owner, () => {
+      owner.once("destroyed", () => {
+        disposed += 1;
+      });
+    });
+    __test.releaseAppHostSession(session);
+    assert.equal(owner.listenerCount("destroyed"), 1);
+  }
+
+  assert.equal(disposed, 80);
+});
+
+test("releases an app-host session resolved after its relay was replaced", async () => {
+  const owner = new EventEmitter();
+  const disposed = [];
+  owner.once("destroyed", () => disposed.push("replaced"));
+  const listener = owner.rawListeners("destroyed")[0];
+  let finishConnect;
+  const pendingConnect = new Promise((resolve) => {
+    finishConnect = resolve;
+  });
+  const relay = createOfficialAppHostRelay({
+    clientId: "client",
+    portId: "port",
+    connectPort: () => pendingConnect,
+    createMessageChannel: createFakeMessageChannel,
+  });
+
+  relay.close("replaced");
+  finishConnect({ listeners: [listener], owner, released: false });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(disposed, ["replaced"]);
+  assert.equal(owner.listenerCount("destroyed"), 0);
+});
+
+test("releases an app-host session when its connected relay closes", async () => {
+  const owner = new EventEmitter();
+  const disposed = [];
+  owner.once("destroyed", () => disposed.push("closed"));
+  const listener = owner.rawListeners("destroyed")[0];
+  const relay = createOfficialAppHostRelay({
+    clientId: "client",
+    portId: "port",
+    connectPort: async () => ({ listeners: [listener], owner, released: false }),
+    createMessageChannel: createFakeMessageChannel,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  relay.close("client_disconnected");
+
+  assert.deepEqual(disposed, ["closed"]);
+  assert.equal(owner.listenerCount("destroyed"), 0);
+});
 
 test("forwards structured official app-host messages and preserves close signals", () => {
   const forwarded = [];
