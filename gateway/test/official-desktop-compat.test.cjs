@@ -1414,10 +1414,13 @@ test("macOS integrity refresh leaves disabled slots alone and rejects unknown ve
   const { root, runnerAsarPath } = await createIntegrityFixture(t);
   const frameworksDir = path.join(root, "Frameworks");
   const disabledPath = path.join(frameworksDir, "Disabled.framework", "Disabled");
+  const pendingPath = path.join(frameworksDir, "Pending.framework", "Pending");
   const unknownPath = path.join(frameworksDir, "Unknown.framework", "Unknown");
   const disabled = Buffer.concat([integritySlot(0, 0), Buffer.from("disabled")]);
+  const pending = Buffer.concat([integritySlot(1, 1), Buffer.from("pending")]);
   const unknown = Buffer.concat([integritySlot(1, 2), Buffer.from("unknown")]);
   writeFile(disabledPath, disabled);
+  writeFile(pendingPath, pending);
   writeFile(unknownPath, unknown);
 
   assert.throws(
@@ -1425,8 +1428,29 @@ test("macOS integrity refresh leaves disabled slots alone and rejects unknown ve
     /Unsupported macOS integrity digest version 2/
   );
   assert.deepEqual(fs.readFileSync(disabledPath), disabled);
+  assert.deepEqual(fs.readFileSync(pendingPath), pending);
   assert.deepEqual(fs.readFileSync(unknownPath), unknown);
 });
+
+test(
+  "macOS integrity refresh rejects framework binaries that escape the runner cache",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const { root, runnerAsarPath } = await createIntegrityFixture(t);
+    const frameworksDir = path.join(root, "Frameworks");
+    const externalBinary = path.join(root, "installed", "External");
+    const externalData = Buffer.concat([integritySlot(1, 1), Buffer.from("external")]);
+    writeFile(externalBinary, externalData);
+    fs.mkdirSync(path.join(frameworksDir, "External.framework"), { recursive: true });
+    fs.symlinkSync(externalBinary, path.join(frameworksDir, "External.framework", "External"));
+
+    assert.throws(
+      () => refreshMacIntegrity(frameworksDir, runnerAsarPath),
+      /escapes its cache directory/
+    );
+    assert.deepEqual(fs.readFileSync(externalBinary), externalData);
+  }
+);
 
 test(
   "macOS runner preserves relative Framework links and signs refreshed copies before rebuilding escaped caches",
