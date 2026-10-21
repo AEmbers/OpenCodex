@@ -56,11 +56,13 @@ const TOKEN_USAGE_CAPABILITY_SOURCE = fs.readFileSync(
 );
 
 function sourceSection(source, startMarker, endMarker) {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start + startMarker.length);
+  // Windows checkout 默认使用 CRLF，源码标记统一按 LF 比较，避免测试因换行符产生假失败。
+  const normalizedSource = source.replace(/\r\n/g, "\n");
+  const start = normalizedSource.indexOf(startMarker);
+  const end = normalizedSource.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
   assert.notEqual(end, -1, `missing source marker: ${endMarker}`);
-  return source.slice(start, end);
+  return normalizedSource.slice(start, end);
 }
 
 class ListenerTarget {

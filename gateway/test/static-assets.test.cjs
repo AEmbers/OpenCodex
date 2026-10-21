@@ -326,8 +326,8 @@ test("runtime compatibility diagnostics are public, grouped, explained, and repo
 test("runtime compatibility page follows the public authentication locale", (t) => {
   const webviewDir = makeOfficialWebviewDir(t);
   for (const [locale, expectedTitle] of [
-    ["zh-CN", "OpenCodex虚拟骨架调试"],
-    ["en-US", "OpenCodex Virtual Skeleton Diagnostics"],
+    ["zh-CN", "运行时兼容调试"],
+    ["en-US", "Runtime Compatibility Diagnostics"],
   ]) {
     const service = createService(webviewDir, null, locale);
     const reqPath = "/settings/developer/runtime-compatibility";
@@ -1578,7 +1578,8 @@ test("external plugins require an SDK-compatible ESM v2 entry and never execute 
     const entries = listPluginEntries();
     const modern = entries.find((entry) => entry.manifest.id === "example.modern");
     const legacy = entries.find((entry) => entry.manifest.id === "example.legacy");
-    assert.equal(modern.entryFile, fs.realpathSync(path.join(modernDir, "dist", "index.mjs")));
+    // Windows 临时目录可能同时存在 8.3 短路径与长路径；双方都先 realpath 后再比较。
+    assert.equal(modern.entryFile, fs.realpathSync.native(path.join(modernDir, "dist", "index.mjs")));
     assert.match(modern.urlPath, /modern-plugin\/entry\.mjs$/);
     assert.equal(pluginEntryFileFromRequestPath(`/opencodex-plugins/${modern.urlPath}`), modern.entryFile);
     assert.equal(legacy.entryFile, null);

@@ -104,13 +104,14 @@ test("scanner falls back from a missing cached Codex source to ChatGPT and still
   writeFile(codexAsar);
 
   const scanner = new CodexAsarScanner({ defaultCandidates: [chatGptRoot, codexRoot] });
+  // 生产扫描器使用 native realpath，Windows 下会统一为长路径，测试也必须按同一规范比较。
   assert.equal(
     scanner.find({ cachedAsarPath: path.join(root, "missing", "app.asar") }).asarPath,
-    fs.realpathSync(chatGptAsar)
+    fs.realpathSync.native(chatGptAsar)
   );
 
   fs.rmSync(chatGptRoot, { recursive: true, force: true });
-  assert.equal(scanner.find().asarPath, fs.realpathSync(codexAsar));
+  assert.equal(scanner.find().asarPath, fs.realpathSync.native(codexAsar));
 });
 
 test("runtime entry resolver accepts legacy and early bootstrap across ASAR separators", () => {
@@ -728,7 +729,9 @@ test("runtime optimizer bounds hidden gateway sidebar Git discovery without chan
     },
   };
   const notRepositoryMessage = "fatal: not a git repository";
-  assert.deepEqual(await hiddenFixture.run("/cloud-missing", [], skippedHost), {
+  // 预检使用平台原生 path；用当前平台的绝对路径，避免 Windows 将 POSIX 形式误判为非绝对路径。
+  const missingWorkspace = path.join(os.tmpdir(), "opencodex-cloud-missing-workspace");
+  assert.deepEqual(await hiddenFixture.run(missingWorkspace, [], skippedHost), {
     command: "git",
     success: false,
     code: 128,
@@ -738,7 +741,7 @@ test("runtime optimizer bounds hidden gateway sidebar Git discovery without chan
     stderrBytes: notRepositoryMessage.length,
   });
   // 相同失效目录直接复用失败缓存，既不再次触碰云盘，也不会进入 Git spawn 主体。
-  assert.deepEqual(await hiddenFixture.run("/cloud-missing", [], skippedHost), {
+  assert.deepEqual(await hiddenFixture.run(missingWorkspace, [], skippedHost), {
     command: "git",
     success: false,
     code: 128,
@@ -754,7 +757,7 @@ test("runtime optimizer bounds hidden gateway sidebar Git discovery without chan
   assert.ok(failedCommandEntry?.expiresAt - Date.now() > 59_000, "后台失败结果必须退避一分钟");
   failedCommandEntry.expiresAt = Date.now() - 1;
   const staleStartedAt = Date.now();
-  assert.deepEqual(await hiddenFixture.run("/cloud-missing", [], skippedHost), {
+  assert.deepEqual(await hiddenFixture.run(missingWorkspace, [], skippedHost), {
     command: "git",
     success: false,
     code: 128,
