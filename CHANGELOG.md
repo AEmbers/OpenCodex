@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.3
+
+### Fixed
+
+- Restore the shared IPC argument normalizer used by the official-runtime fetch preparse, preventing `fetchMessageFromIpcArgs is not defined` from blocking persisted atom synchronization and leaving the browser on the GPT startup icon.
+- Intercept direct `POST /wham/statsig/bootstrap` fetches in the web shell so the current official renderer can finish its post-login Statsig provider initialization.
+
 ## 2.1.2
 
 ### Fixed
