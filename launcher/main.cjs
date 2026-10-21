@@ -1159,22 +1159,10 @@ function hideLauncherDockIconIfWindowless() {
 function presentLauncherWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
+  // 只有托盘、second-instance 或系统的 activate 等明确用户动作才会进入这里；
+  // 单次 show/focus 足够恢复窗口，不再延迟重复激活或强制抢占其他应用焦点。
   mainWindow.show();
-  try {
-    if (process.platform === "darwin" && typeof app.focus === "function") app.focus({ steal: true });
-  } catch {}
-  try {
-    if (typeof mainWindow.moveTop === "function") mainWindow.moveTop();
-  } catch {}
   mainWindow.focus();
-}
-
-function scheduleLauncherWindowPresent() {
-  presentLauncherWindow();
-  for (const delayMs of [80, 250]) {
-    const timer = setTimeout(presentLauncherWindow, delayMs);
-    if (timer && typeof timer.unref === "function") timer.unref();
-  }
 }
 
 async function showLauncherWindow() {
@@ -1182,8 +1170,7 @@ async function showLauncherWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
   if (!mainWindow || mainWindow.isDestroyed()) return;
   startStatusPolling();
-  // macOS 从 accessory 切回 regular 后窗口有时会先创建在后台；短延迟重试确保从托盘打开时直接前置。
-  scheduleLauncherWindowPresent();
+  presentLauncherWindow();
 }
 
 function createTrayImage() {
