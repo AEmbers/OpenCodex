@@ -897,20 +897,45 @@ test("bridge resolves window focus from the browser instead of the hidden Electr
 
 test("bridge suppresses only mobile-subscription billing 400 fallback toasts", () => {
   const bridge = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
-  const declaration = sourceFunctionDeclaration(bridge, "shouldSurfaceFetchIpcError");
-  const shouldSurface = new Function(`${declaration}; return shouldSurfaceFetchIpcError;`)();
+  const declarations = [
+    sourceFunctionDeclaration(bridge, "isKnownMobileSubscriptionBillingToast"),
+    sourceFunctionDeclaration(bridge, "shouldSurfaceFetchIpcError"),
+  ].join("\n");
+  const shouldSurface = new Function(`${declarations}; return shouldSurfaceFetchIpcError;`)();
+  const paymentMethodsUrl = "https://chatgpt.com/backend-api/payments/payment_methods?account_id=test";
+  const exactError = "Payment methods for mobile subscriptions must be managed in the mobile platform.";
+  const alternateExactError = "Mobile subscriptions must be managed in the mobile platform.";
 
+  assert.equal(shouldSurface(400, exactError, paymentMethodsUrl), false);
+  assert.equal(shouldSurface(400, alternateExactError, paymentMethodsUrl), false);
   assert.equal(
-    shouldSurface(400, "Payment methods for mobile subscriptions must be managed in the mobile platform."),
+    shouldSurface(400, exactError, "/payments/payment_methods?account_id=test"),
     false
   );
+  // 同文案来自其他接口时必须继续展示，不能被全局字符串规则吞掉。
+  assert.equal(shouldSurface(400, exactError, "https://chatgpt.com/backend-api/other"), true);
   assert.equal(
-    shouldSurface(400, "Mobile subscriptions must be managed in the mobile platform."),
-    false
+    shouldSurface(400, exactError, "https://chatgpt.com.evil.example/backend-api/payments/payment_methods"),
+    true
   );
-  assert.equal(shouldSurface(400, "Unrelated billing request failed"), true);
-  assert.equal(shouldSurface(500, "unsupported codex ipc channel"), true);
-  assert.equal(shouldSurface(500, "Payment methods for mobile subscriptions"), false);
+  assert.equal(
+    shouldSurface(400, exactError, "http://chatgpt.com/backend-api/payments/payment_methods"),
+    true
+  );
+  assert.equal(
+    shouldSurface(400, exactError, "https://chatgpt.com:8443/backend-api/payments/payment_methods"),
+    true
+  );
+  assert.equal(shouldSurface(400, `${exactError} Retry later.`, paymentMethodsUrl), true);
+  assert.equal(shouldSurface(400, "mobile subscriptions must be managed", paymentMethodsUrl), true);
+  assert.equal(shouldSurface(400, "Unrelated billing request failed", paymentMethodsUrl), true);
+  assert.equal(shouldSurface(500, "unsupported codex ipc channel", paymentMethodsUrl), true);
+  assert.equal(shouldSurface(500, exactError, paymentMethodsUrl), false);
+  // 端到端保留 wiring 断言，防止调用点再次丢掉 URL 只按文案过滤。
+  assert.match(
+    bridge,
+    /shouldSurfaceFetchIpcError\(Number\.isFinite\(status\) \? status : undefined, message, url\)/
+  );
 });
 
 test("patched official renderer CSP allows the injected PWA manifest", (t) => {

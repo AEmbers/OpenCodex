@@ -1574,13 +1574,32 @@
     return bodyError || `IPC invoke failed: ${channel} (${status})`;
   }
 
+  /**
+   * 只识别官方移动订阅支付方式查询的完整响应，避免用宽泛短语吞掉其他账单错误。
+   * 日志中的 url 可能是 /payments/payment_methods，也可能是完整 backend-api URL，两者都要精确匹配。
+   */
+  function isKnownMobileSubscriptionBillingToast(url, message) {
+    let parsed;
+    try {
+      parsed = new URL(String(url || ""), "https://chatgpt.com");
+    } catch {
+      return false;
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const knownPath =
+      pathname === "/payments/payment_methods" ||
+      pathname === "/backend-api/payments/payment_methods";
+    if (parsed.origin !== "https://chatgpt.com" || !knownPath) return false;
+    return /^(?:Payment methods for mobile subscriptions must be managed in the mobile platform|Mobile subscriptions must be managed in the mobile platform)\.$/i.test(
+      String(message || "").trim()
+    );
+  }
+
   /** 只兜底展示 fetch 形态的 IPC 兼容错误，invoke 错误交给官方前端调用栈自然处理。 */
-  function shouldSurfaceFetchIpcError(status, message) {
+  function shouldSurfaceFetchIpcError(status, message, url) {
     if (status === 400) {
       // 移动订阅的账单/支付方式提示对网页使用无影响，官方客户端也会静默忽略。
-      if (/payment methods for mobile subscriptions|mobile subscriptions must be managed/i.test(message || "")) {
-        return false;
-      }
+      if (isKnownMobileSubscriptionBillingToast(url, message)) return false;
       return true;
     }
     return /unsupported codex ipc channel|method not found|no electron ipc handler|invalid ipc channel/i.test(
@@ -1701,8 +1720,8 @@
     const message = normalizeErrorMessage(payload.error);
     if (!message) return;
     const status = Number(payload.status || 0);
-    if (!shouldSurfaceFetchIpcError(Number.isFinite(status) ? status : undefined, message)) return;
     const url = typeof payload.url === "string" && payload.url ? payload.url : channel;
+    if (!shouldSurfaceFetchIpcError(Number.isFinite(status) ? status : undefined, message, url)) return;
     const key = `${url}:${message}`;
     const now = Date.now();
     if (ipcErrorToastState.lastKey === key && now - ipcErrorToastState.lastShownAtMs < 3000) {
